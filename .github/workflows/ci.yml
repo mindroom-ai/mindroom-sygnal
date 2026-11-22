@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pushkin-tests:
+    name: Sygnal v0.17.0 pushkin tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unit tests inside pinned Sygnal v0.17.0 image
+        run: |
+          docker run --rm --network=none --entrypoint python \
+            -e PYTHONPATH=/sygnal \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD:/sygnal:ro" \
+            docker.io/matrixdotorg/sygnal@sha256:141f5e72fdf99a28e29ca87f3a46c19ed1cf21d5074aa3ef9df7c067e0c1c46a \
+            -m unittest discover -s /sygnal -p "test_*.py" -v
+
+  nix:
+    name: Nix flake check & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check and build flake
+        run: |
+          nix flake check --print-build-logs
+          nix build --no-link --print-out-paths
