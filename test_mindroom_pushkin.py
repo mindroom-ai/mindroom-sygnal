@@ -249,6 +249,51 @@ class StripMarkdownTestCase(unittest.TestCase):
                 "First line here\nSecond line",
             ),
             ("crlf_line_endings", "# Title\r\n\r\n**Body**\r\n", "Title\nBody"),
+            (
+                "matrix_emote_reply_fallback",
+                "> * <@alice:example.com> waves hello\n> continued\n\n**My reply**",
+                "My reply",
+            ),
+            (
+                "code_fence_preserves_indentation_and_spaces",
+                "```python\n    def foo():\n        return  1\n```",
+                "    def foo():\n        return  1",
+            ),
+            (
+                "table_pipe_inside_inline_code",
+                "| `a|b` | **c** |\n| --- | --- |\n| ``a|b ` c`` | d |",
+                "a|b · c\na|b ` c · d",
+            ),
+            (
+                "double_backtick_inline_code",
+                "Use ``a ` b`` and `` `foo` `` here",
+                "Use a ` b and `foo` here",
+            ),
+            (
+                "nul_and_empty_image_with_inline_code_no_collision",
+                "\x00![](x)\x00`code` and \x00C999\x00![](x)\x00`ok`",
+                "\x00\x00code and \x00C999\x00\x00ok",
+            ),
+            (
+                "escaped_asterisks_preserved",
+                r"a\*b\* and \*not italic\*",
+                r"a\*b\* and \*not italic\*",
+            ),
+            (
+                "inline_and_display_math_preserved",
+                "Inline $a *b* c$ and display $$x *y* z$$",
+                "Inline $a *b* c$ and display $$x *y* z$$",
+            ),
+            (
+                "currency_not_treated_as_math",
+                "Costs **$5** and **$10**; between $5 and *almost* $10",
+                "Costs $5 and $10; between $5 and almost $10",
+            ),
+            (
+                "indented_tool_call_marker_stays_prose",
+                "  🔧 `shell` [1]",
+                "🔧 shell [1]",
+            ),
         ]
         for label, raw, expected in cases:
             with self.subTest(case=label):
@@ -262,7 +307,10 @@ class StripMarkdownTestCase(unittest.TestCase):
             ("unclosed_bold", "**a " * 50_000),
             ("unclosed_italic", "*a " * 50_000),
             ("unclosed_strike", "~~a " * 50_000),
+            ("unclosed_math", "$a " * 50_000),
             ("long_hr_miss", "- " * 50_000 + "x"),
+            ("many_short_lines", "a\n" * 5_000),
+            ("many_table_rows", "|a|b|\n" * 2_000),
             ("many_tool_markers", "🔧 `shell` [1]\n" * 5_000 + "**done**"),
             ("huge_reply_fallback", "> <@a:b> " + "x" * 100_000 + "\n\n**reply**"),
         ]
@@ -288,6 +336,13 @@ class StripMarkdownTestCase(unittest.TestCase):
         self.assertEqual(_truncate_utf8("😀", 3), "")
         self.assertEqual(_truncate_utf8("café", 4), "caf")
         self.assertEqual(_truncate_utf8("café", 5), "café")
+        # JSON-escaped quotes count as 2 bytes each (\")
+        truncated_quotes = _truncate_utf8('"' * 300, 256)
+        self.assertEqual(len(truncated_quotes), 128)
+        self.assertLessEqual(
+            len(json.dumps(truncated_quotes, ensure_ascii=False).encode("utf-8")) - 2,
+            256,
+        )
 
 
 class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
@@ -428,6 +483,33 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                     "counts": {"unread": 3},
                     "devices": [_dev(tweaks=rt, default_payload={"aps": {"mutable-content": 1}, RING_PAYLOAD_KEY: {"expires_at": 1}})],
                 },
+            ),
+            (
+                "member_join_with_empty_default_alert_stays_badge_only",
+                _raw(
+                    event_type="m.room.member",
+                    membership="join",
+                    user_is_target=False,
+                    default_payload={"aps": {"alert": {}}},
+                ),
+            ),
+            (
+                "member_join_with_custom_default_alert_stays_badge_only",
+                _raw(
+                    event_type="m.room.member",
+                    membership="join",
+                    user_is_target=False,
+                    default_payload={"aps": {"alert": {"loc-key": "CUSTOM"}}},
+                ),
+            ),
+            (
+                "member_invite_not_target_with_default_alert_stays_badge_only",
+                _raw(
+                    event_type="m.room.member",
+                    membership="invite",
+                    user_is_target=False,
+                    default_payload={"aps": {"alert": {}}},
+                ),
             ),
         ]
         for label, raw in cases:
@@ -777,6 +859,55 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                     self.assertLessEqual(len(alert["title"].encode("utf-8")), MAX_ALERT_TITLE_BYTES)
                 if "subtitle" in alert:
                     self.assertLessEqual(len(alert["subtitle"].encode("utf-8")), MAX_ALERT_SUBTITLE_BYTES)
+
+    async def test_large_default_payload_and_control_char_names_never_regress(self) -> None:
+        # 1. Large default_payload.custom_data (3500B & 3850B) must never raise BodyTooLongException
+        #    when stock ApnsPushkin can deliver the notification.
+        for pad_size in (3500, 3850):
+            with self.subTest(custom_data_bytes=pad_size):
+                self.sent[APP_ID].clear()
+                self.sent[STOCK_APP_ID].clear()
+                raw = _raw(
+                    event_type="m.room.message",
+                    room_name="Engineering Room",
+                    content={"msgtype": "m.text", "body": "**hello**"},
+                    default_payload={"custom_data": "x" * pad_size},
+                )
+                raw_stock = copy.deepcopy(raw)
+                raw_stock["devices"][0]["app_id"] = STOCK_APP_ID
+
+                self.assertEqual(await self._dispatch(Notification(copy.deepcopy(raw))), [])
+                self.assertEqual(await self._dispatch(Notification(raw_stock), pushkin=self.stock), [])
+                self.assertEqual(len(self.sent[APP_ID]), 1)
+                self.assertEqual(len(self.sent[STOCK_APP_ID]), 1)
+                msg = self.sent[APP_ID][0].message
+                self.assertLessEqual(len(json.dumps(msg, ensure_ascii=False).encode("utf-8")), 4096)
+
+        # 2. Control characters and JSON-escaped quotes in names must fit within 4096 bytes.
+        name_cases = [
+            ("only_control_chars", "\x01" * 300, "\x02" * 300),
+            ("interleaved_control_chars", "A\x01" * 300, "B\x02" * 300),
+            ("quotes_in_names", '"' * 300, '"' * 300),
+        ]
+        for label, sname, rname in name_cases:
+            with self.subTest(case=label):
+                self.sent[APP_ID].clear()
+                raw = _raw(
+                    event_type="m.room.message",
+                    sender_display_name=sname,
+                    room_name=rname,
+                    content={"msgtype": "m.text", "body": "Hello **world**"},
+                )
+                self.assertEqual(await self._dispatch(Notification(raw)), [])
+                self.assertEqual(len(self.sent[APP_ID]), 1)
+                msg = self.sent[APP_ID][0].message
+                encoded = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+                self.assertLessEqual(len(encoded), 4096)
+                # Control chars must be sanitized out of alert/metadata fields.
+                self.assertNotIn("\x01", msg["aps"]["alert"].get("title", ""))
+                self.assertNotIn("\x02", msg["aps"]["alert"].get("subtitle", ""))
+                self.assertNotIn("\x01", msg.get("sender_display_name", ""))
+                self.assertNotIn("\x02", msg.get("room_name", ""))
 
     async def test_default_payload_spoofing_defense(self) -> None:
         spoofed = {
