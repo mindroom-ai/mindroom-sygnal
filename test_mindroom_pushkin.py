@@ -21,6 +21,7 @@ import copy
 import importlib
 import json
 import logging
+import random
 import time
 import unittest
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -42,15 +43,20 @@ from mindroom_pushkin import (
     MAX_SENDER_BYTES,
     MAX_SENDER_DISPLAY_NAME_BYTES,
     MAX_THREAD_ID_BYTES,
+    MIN_PREVIEW_BYTES,
+    PLAIN_PAYLOAD_KEY,
     RING_HINT_KEY,
     RING_PAYLOAD_KEY,
     RING_SOUND,
     RTC_NOTIFICATION_TYPE,
     MindroomApnsPushkin,
+    _clean_display_field,
     _truncate_utf8,
     strip_markdown,
 )
+from sygnal import apnstruncate
 from sygnal.apnspushkin import ApnsPushkin
+from sygnal.apnstruncate import BodyTooLongException
 from sygnal.notifications import Notification, NotificationContext
 from sygnal.sygnal import CONFIG_DEFAULTS, Sygnal, merge_left_with_defaults
 from sygnal.utils import NotificationLoggerAdapter
@@ -129,6 +135,61 @@ def _ring(sender_ts: int, lifetime: int = 30_000, intent: Optional[str] = "audio
 
 def _enc(hint: Any) -> Dict[str, Any]:
     return {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque", RING_HINT_KEY: hint}
+
+
+# Every gateway-owned field a pusher could try to pre-seed through default_payload.
+# All spoofed values contain "spoof" so tests can assert none of them survive.
+SPOOFED_DEFAULT_PAYLOAD: Dict[str, Any] = {
+    "sender": "@spoof:evil.example",
+    "sender_display_name": "Spoofed Admin",
+    "room_name": "Spoofed Room",
+    RING_PAYLOAD_KEY: {"expires_at": 1, "spoof": True},
+    PLAIN_PAYLOAD_KEY: "spoof",
+    "custom": "kept",
+    "aps": {
+        "mutable-content": 0,
+        "thread-id": "!spoof:evil.example",
+        "sound": "default",
+        "alert": {
+            "title": "Spoofed Title",
+            "subtitle": "Spoofed Subtitle",
+            "title-loc-key": "SPOOF_TITLE",
+            "title-loc-args": ["spoof"],
+            "subtitle-loc-key": "SPOOF_SUBTITLE",
+            "subtitle-loc-args": ["spoof"],
+            "action-loc-key": "OPEN",
+        },
+    },
+}
+REAL_IDENTITY: Dict[str, Any] = {
+    "sender": "@real:example.com",
+    "sender_display_name": "Real User",
+    "room_name": "Real Room",
+    "room_id": "!real:example.com",
+}
+
+
+def _json_size(message: Dict[str, Any]) -> int:
+    return len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
+
+
+def _without_reserved_fields(stock_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a stock payload minus every gateway-owned field."""
+    payload = copy.deepcopy(stock_payload)
+    for key in ("sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY):
+        payload.pop(key, None)
+    for key in ("thread-id", "mutable-content"):
+        payload["aps"].pop(key, None)
+    for key in (
+        "title",
+        "subtitle",
+        "title-loc-key",
+        "title-loc-args",
+        "subtitle-loc-key",
+        "subtitle-loc-args",
+    ):
+        payload["aps"]["alert"].pop(key, None)
+    return payload
 
 
 class StripMarkdownTestCase(unittest.TestCase):
@@ -294,6 +355,22 @@ class StripMarkdownTestCase(unittest.TestCase):
                 "  🔧 `shell` [1]",
                 "🔧 shell [1]",
             ),
+            ("math_wrapping_inline_code", "$`total`$", "$total$"),
+            ("math_containing_inline_code", "Math $`x` + 1$", "Math $x + 1$"),
+            (
+                "literal_private_use_char_survives_token_restore",
+                "\ue000 `x` and $`y`$",
+                "\ue000 x and $y$",
+            ),
+            ("inline_code_inner_spaces_preserved", "Use `a  b` here", "Use a  b here"),
+            ("inline_code_inner_tab_preserved", "Run  `a\tb`  now", "Run a\tb now"),
+            (
+                "table_inline_code_inner_spaces_preserved",
+                "| `a  b` | c   d |\n| --- | --- |",
+                "a  b · c d",
+            ),
+            ("whitespace_only_inline_code_is_empty", "` `\n`  `", ""),
+            ("lone_surrogates_replaced", "**hi** \udc00 there", "hi \ufffd there"),
         ]
         for label, raw, expected in cases:
             with self.subTest(case=label):
@@ -343,6 +420,15 @@ class StripMarkdownTestCase(unittest.TestCase):
             len(json.dumps(truncated_quotes, ensure_ascii=False).encode("utf-8")) - 2,
             256,
         )
+
+    def test_lone_surrogates_are_replaced_not_raised(self) -> None:
+        self.assertEqual(_truncate_utf8("a\ud800b", 10), "a\ufffdb")
+        self.assertEqual(_truncate_utf8("\udfff" * 4, 6), "\ufffd\ufffd")
+        self.assertEqual(_truncate_utf8("@al\ud83dice:example.com", 256), "@al\ufffdice:example.com")
+        self.assertEqual(_clean_display_field("Al\ud83dice\x01"), "Al\ufffdice")
+        # A well-formed astral character is one code point, not a surrogate pair.
+        self.assertEqual(_truncate_utf8("😀", 4), "😀")
+        self.assertEqual(_clean_display_field("😀"), "😀")
 
 
 class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
@@ -420,6 +506,30 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             (pushkin or self.pushkin).dispatch_notification(notif, notif.devices[0], ctx),
             advance=advance,
         )
+
+    async def _send(self, raw: Dict[str, Any], *, stock: bool = False) -> Optional[Dict[str, Any]]:
+        """Dispatch ``raw`` and return the APNs message, or None if Sygnal found it too long."""
+        raw = copy.deepcopy(raw)
+        app_id = STOCK_APP_ID if stock else APP_ID
+        raw["devices"][0]["app_id"] = app_id
+        self.sent[app_id].clear()
+        try:
+            rejected = await self._dispatch(
+                Notification(raw), pushkin=self.stock if stock else self.pushkin
+            )
+        except BodyTooLongException:
+            return None
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(self.sent[app_id]), 1)
+        return self.sent[app_id][0].message
+
+    def _stock_payload(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the untruncated payload stock ApnsPushkin builds for ``raw``."""
+        notif = Notification(copy.deepcopy(raw))
+        log = NotificationLoggerAdapter(logging.getLogger(__name__), {"request_id": "req-stock"})
+        payload = self.stock._get_payload_full(notif, notif.devices[0], log, True)
+        assert payload is not None
+        return payload
 
     async def test_valid_rings(self) -> None:
         t = self.now_ms
@@ -511,6 +621,25 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                     default_payload={"aps": {"alert": {}}},
                 ),
             ),
+            (
+                "member_join_with_reserved_fields_stays_stock",
+                _raw(
+                    event_type="m.room.member",
+                    membership="join",
+                    user_is_target=False,
+                    default_payload=SPOOFED_DEFAULT_PAYLOAD,
+                ),
+            ),
+            (
+                "event_id_only_with_reserved_fields_stays_stock",
+                {
+                    "room_id": "!room:example.com",
+                    "event_id": "$e3",
+                    "prio": "high",
+                    "counts": {"unread": 1},
+                    "devices": [_dev(default_payload=SPOOFED_DEFAULT_PAYLOAD)],
+                },
+            ),
         ]
         for label, raw in cases:
             with self.subTest(case=label):
@@ -587,7 +716,11 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(got.time_to_live)
                 self.assertEqual(got.message["aps"].get("sound"), want.message["aps"].get("sound"))
                 self.assertNotEqual(got.message["aps"].get("sound"), RING_SOUND)
-                self.assertEqual(got.message.get(RING_PAYLOAD_KEY), want.message.get(RING_PAYLOAD_KEY))
+                # Only a validated ring may carry mindroom_ring: a caller-supplied one is
+                # stripped (unlike stock) so the iOS extension never treats a message as a ring.
+                self.assertNotIn(RING_PAYLOAD_KEY, got.message)
+                if label == "caller_ring_field_full":
+                    self.assertEqual(want.message[RING_PAYLOAD_KEY], {"expires_at": 1})
                 self.assertEqual(got.message["aps"]["mutable-content"], 1)
                 self.assertEqual(got.message["aps"]["thread-id"], "!room:example.com")
                 self.assertEqual(got.message["sender"], "@alice:example.com")
@@ -667,6 +800,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.sent[APP_ID]), 1)
                 msg = self.sent[APP_ID][0].message
                 self.assertEqual(msg["aps"]["alert"], expected_alert)
+                self.assertEqual(msg[PLAIN_PAYLOAD_KEY], 1)
                 self.assertEqual(msg["aps"]["mutable-content"], 1)
                 self.assertEqual(msg["aps"]["thread-id"], "!room:example.com")
                 if expected_room_name is not None:
@@ -719,6 +853,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.sent[APP_ID]), 1)
                 msg = self.sent[APP_ID][0].message
                 self.assertEqual(msg["aps"]["alert"], expected_alert)
+                self.assertNotIn(PLAIN_PAYLOAD_KEY, msg)
                 self.assertEqual(msg["aps"]["mutable-content"], 1)
                 self.assertEqual(msg["aps"]["thread-id"], "!room:example.com")
                 self.assertEqual(msg["sender"], "@alice:example.com")
@@ -749,6 +884,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self._dispatch(Notification(raw)), [])
                 msg = self.sent[APP_ID][0].message
                 self.assertEqual(msg["aps"]["alert"], expected_alert)
+                self.assertNotIn(PLAIN_PAYLOAD_KEY, msg)
                 self.assertEqual(msg["aps"]["mutable-content"], 1)
                 self.assertEqual(msg["aps"]["thread-id"], "!room:example.com")
                 self.assertEqual(msg["sender"], "@alice:example.com")
@@ -798,6 +934,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(msg["sender"], "@alice:example.com")
                 self.assertEqual(msg["sender_display_name"], "Alice")
                 self.assertEqual(msg["room_name"], expected_room)
+                self.assertNotIn(PLAIN_PAYLOAD_KEY, msg)
 
     async def test_oversized_multibyte_utf8_fits_within_4096_bytes(self) -> None:
         big_sender_name = "😀" * 500
@@ -962,6 +1099,333 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("room_name", msg_absent)
         self.assertNotIn("thread-id", msg_absent["aps"])
         self.assertEqual(msg_absent["aps"]["mutable-content"], 1)
+
+    async def test_reserved_fields_sanitized_on_every_event_alert(self) -> None:
+        # (label, event type, content, extra _raw kwargs, gateway-stripped structured body?)
+        events: List[Tuple[str, str, Optional[Dict[str, Any]], Dict[str, Any], bool]] = [
+            ("text", "m.room.message", {"msgtype": "m.text", "body": "**Hello**"}, {}, True),
+            ("notice", "m.room.message", {"msgtype": "m.notice", "body": "**Hello**"}, {}, True),
+            ("text_empty_after_strip", "m.room.message", {"msgtype": "m.text", "body": "---"}, {}, False),
+            ("emote", "m.room.message", {"msgtype": "m.emote", "body": "**waves**"}, {}, False),
+            ("emote_empty_after_strip", "m.room.message", {"msgtype": "m.emote", "body": "---"}, {}, False),
+            ("image", "m.room.message", {"msgtype": "m.image", "body": "sunset.jpg"}, {}, False),
+            ("encrypted", ENCRYPTED_EVENT_TYPE, {"algorithm": "m.megolm.v1.aes-sha2"}, {}, False),
+            ("invite", "m.room.member", None, {"user_is_target": True, "membership": "invite"}, False),
+            ("legacy_call_invite", "m.call.invite", {"offer": {"sdp": "v=0\r\nm=audio 9\r\n"}}, {}, False),
+            ("unknown_type", "com.example.custom", {"x": 1}, {}, False),
+        ]
+        identities: List[Tuple[str, Dict[str, Any]]] = [
+            ("present", REAL_IDENTITY),
+            ("absent", {key: None for key in REAL_IDENTITY}),
+        ]
+        for label, event_type, content, extra, is_plain in events:
+            for identity_label, identity in identities:
+                with self.subTest(case=label, identity=identity_label):
+                    msg = await self._send(
+                        _raw(
+                            event_type=event_type,
+                            content=content,
+                            default_payload=SPOOFED_DEFAULT_PAYLOAD,
+                            **identity,
+                            **extra,
+                        )
+                    )
+                    assert msg is not None
+                    self.assertNotIn("spoof", json.dumps(msg).lower())
+                    self.assertNotIn(RING_PAYLOAD_KEY, msg)
+                    self.assertEqual(msg.get(PLAIN_PAYLOAD_KEY), 1 if is_plain else None)
+                    self.assertEqual(msg["custom"], "kept")
+                    self.assertEqual(msg.get("sender"), identity["sender"])
+                    self.assertEqual(msg.get("sender_display_name"), identity["sender_display_name"])
+                    self.assertEqual(msg.get("room_name"), identity["room_name"])
+                    aps = msg["aps"]
+                    self.assertEqual(aps["sound"], "default")
+                    self.assertEqual(aps["mutable-content"], 1)
+                    self.assertEqual(aps.get("thread-id"), identity["room_id"])
+                    alert = aps["alert"]
+                    if is_plain:
+                        self.assertEqual(alert["title"], identity["sender_display_name"] or " ")
+                        self.assertEqual(alert.get("subtitle"), identity["room_name"])
+                        self.assertEqual(alert["body"], "Hello")
+                    else:
+                        self.assertIn("loc-key", alert)
+                        self.assertNotIn("title", alert)
+                        self.assertNotIn("subtitle", alert)
+
+    async def test_3872_byte_default_payload_keeps_short_text_preview(self) -> None:
+        default_payload = {"custom_data": ""}
+        default_payload["custom_data"] = "x" * (3872 - _json_size(default_payload))
+        self.assertEqual(_json_size(default_payload), 3872)
+        raw = _raw(
+            event_type="m.room.message",
+            room_name="Engineering Room",
+            content={"msgtype": "m.text", "body": "**hello**"},
+            default_payload=default_payload,
+        )
+        want = await self._send(raw, stock=True)
+        got = await self._send(raw)
+        assert want is not None and got is not None
+        self.assertEqual(
+            want["aps"]["alert"]["loc-args"], ["Alice", "Engineering Room", "**hello**"]
+        )
+        # The gateway metadata does not fit next to the whole preview, so the push
+        # degrades to the stock payload instead of truncating the preview to "".
+        self.assertEqual(got, want)
+        self.assertLessEqual(_json_size(got), 4096)
+
+    async def test_forced_fallback_strips_spoofed_reserved_fields(self) -> None:
+        def _spoofed_raw(pad: int) -> Dict[str, Any]:
+            return _raw(
+                event_type="m.room.message",
+                content={"msgtype": "m.text", "body": "**Hello**"},
+                default_payload={**SPOOFED_DEFAULT_PAYLOAD, "pad": "x" * pad},
+                **REAL_IDENTITY,
+            )
+
+        # Pad until the stock payload minus the reserved fields exactly fills the APNs
+        # limit, so not a single byte of gateway metadata can be added.
+        pad = 4096 - _json_size(_without_reserved_fields(self._stock_payload(_spoofed_raw(0))))
+        raw = _spoofed_raw(pad)
+        expected = _without_reserved_fields(self._stock_payload(raw))
+        self.assertEqual(_json_size(expected), 4096)
+
+        got = await self._send(raw)
+        assert got is not None
+        self.assertEqual(got, expected)
+        self.assertEqual(
+            got["aps"]["alert"],
+            {
+                "action-loc-key": "OPEN",
+                "loc-key": "MSG_FROM_USER_IN_ROOM_WITH_CONTENT",
+                "loc-args": ["Real User", "Real Room", "**Hello**"],
+            },
+        )
+        self.assertNotIn("spoof", json.dumps(got).lower())
+        for key in ("sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY):
+            self.assertNotIn(key, got)
+        self.assertNotIn("thread-id", got["aps"])
+        self.assertNotIn("mutable-content", got["aps"])
+        # Stock cannot deliver this at all once the spoofed fields are counted.
+        self.assertIsNone(await self._send(raw, stock=True))
+
+    async def test_tight_budgets_keep_preview_and_never_restore_spoofed_fields(self) -> None:
+        bodies = [
+            ("short", "**hello**"),
+            ("long_ascii", "**Deploy** " + "status ok " * 30),
+            ("long_emoji", "🌍" * 300),
+        ]
+        default_payloads = [("spoofed", SPOOFED_DEFAULT_PAYLOAD), ("clean", {})]
+        cases = [
+            (payload_label, default_payload, body_label, body)
+            for payload_label, default_payload in default_payloads
+            for body_label, body in bodies
+        ]
+        stages_seen = set()
+        for payload_label, default_payload, body_label, body in cases:
+            clean = strip_markdown(body)
+            for pad in range(3200, 4000, 16):
+                with self.subTest(default_payload=payload_label, body=body_label, pad=pad):
+                    raw = _raw(
+                        event_type="m.room.message",
+                        content={"msgtype": "m.text", "body": body},
+                        default_payload={**default_payload, "pad": "x" * pad},
+                        **REAL_IDENTITY,
+                    )
+                    want = await self._send(raw, stock=True)
+                    got = await self._send(raw)
+                    if want is not None:
+                        # Whenever stock can deliver, so can we.
+                        self.assertIsNotNone(got)
+                    if got is None:
+                        stages_seen.add((payload_label, body_label, "too_long"))
+                        continue
+                    self.assertLessEqual(_json_size(got), 4096)
+                    self.assertNotIn("spoof", json.dumps(got).lower())
+                    self.assertNotIn(RING_PAYLOAD_KEY, got)
+                    alert = got["aps"]["alert"]
+                    if "body" in alert:
+                        stage = "rich" if "room_name" in got else "reduced"
+                        preview = alert["body"]
+                        self.assertEqual(got[PLAIN_PAYLOAD_KEY], 1)
+                        self.assertEqual(got["sender"], "@real:example.com")
+                        self.assertEqual(got["aps"]["thread-id"], "!real:example.com")
+                        self.assertEqual("subtitle" in alert, stage == "rich")
+                        self.assertEqual("sender_display_name" in got, stage == "rich")
+                        self.assertTrue(preview)
+                        self.assertTrue(clean.startswith(preview))
+                        # Sygnal chops whole characters, so allow one partial 4-byte character.
+                        self.assertGreaterEqual(
+                            len(preview.encode("utf-8")),
+                            min(len(clean.encode("utf-8")), MIN_PREVIEW_BYTES - 3),
+                        )
+                    else:
+                        stage = "stock"
+                        # Exactly what Sygnal makes of the stock payload minus reserved fields.
+                        sanitized_stock = _without_reserved_fields(self._stock_payload(raw))
+                        self.assertEqual(got, apnstruncate.truncate(sanitized_stock, 4096))
+                        preview = alert["loc-args"][2]
+                        if want is not None:
+                            # Never less preview than stock would have delivered.
+                            self.assertTrue(
+                                preview.startswith(want["aps"]["alert"]["loc-args"][2])
+                            )
+                    stages_seen.add((payload_label, body_label, stage))
+        self.assertEqual(
+            stages_seen,
+            {
+                (payload_label, body_label, stage)
+                for payload_label, _, body_label, _ in cases
+                for stage in ("rich", "reduced", "stock", "too_long")
+            },
+        )
+
+    def test_fits_with_preview_guarantees_sygnal_keeps_every_preview(self) -> None:
+        rng = random.Random(20261122)
+        alphabet = ["a", "é", "中", "🌍", '"', "\\", " "]
+
+        def _text(max_chars: int) -> str:
+            return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, max_chars)))
+
+        accepted = rejected = 0
+        for _ in range(400):
+            alert: Dict[str, Any] = {"title": _text(40)}
+            if rng.random() < 0.5:
+                alert["body"] = _text(400)
+            if "body" not in alert or rng.random() < 0.6:
+                alert["loc-args"] = [
+                    _text(rng.choice([5, 60, 400])) for _ in range(rng.randint(1, 3))
+                ]
+            payload = {"aps": {"alert": alert, "badge": 1}, "pad": "x" * rng.randint(3300, 4100)}
+            if not self.pushkin._fits_with_preview(payload):
+                rejected += 1
+                continue
+            accepted += 1
+            # Sygnal's own truncation must succeed and leave every preview string
+            # with at least its MIN_PREVIEW_BYTES prefix.
+            shaved = apnstruncate.truncate(copy.deepcopy(payload), 4096)["aps"]["alert"]
+            kept = [(alert[key], shaved[key]) for key in ("body",) if key in alert]
+            kept.extend(zip(alert.get("loc-args", []), shaved.get("loc-args", [])))
+            for original, remaining in kept:
+                floor = original.encode("utf-8")[:MIN_PREVIEW_BYTES].decode("utf-8", "ignore")
+                self.assertTrue(remaining.startswith(floor), (original, remaining))
+        self.assertGreater(accepted, 50)
+        self.assertGreater(rejected, 50)
+
+    async def test_unshortenable_alert_near_limit_matches_stock(self) -> None:
+        # Stock puts a non-string loc-arg in the alert for an image without a text body.
+        # Sygnal cannot shorten such an alert, so metadata is only added if it fits whole.
+        for pad, enriched in ((3000, True), (3900, False)):
+            with self.subTest(pad=pad):
+                raw = _raw(
+                    event_type="m.room.message",
+                    room_name="Photos",
+                    content={"msgtype": "m.image", "body": None},
+                    default_payload={"pad": "x" * pad},
+                )
+                want = await self._send(raw, stock=True)
+                got = await self._send(raw)
+                assert want is not None and got is not None
+                self.assertEqual(got["aps"]["alert"], want["aps"]["alert"])
+                self.assertEqual(got["aps"]["alert"]["loc-args"], ["Alice", None, "Photos"])
+                if enriched:
+                    self.assertEqual(got["sender"], "@alice:example.com")
+                    self.assertEqual(got["aps"]["mutable-content"], 1)
+                else:
+                    self.assertEqual(got, want)
+
+    async def test_sygnal_truncation_runs_exactly_once_per_dispatch(self) -> None:
+        cases = [
+            (
+                "long_image_caption",
+                _raw(
+                    event_type="m.room.message",
+                    room_name="Photos",
+                    content={"msgtype": "m.image", "body": "caption " * 600},
+                    default_payload={"pad": "x" * 3000},
+                ),
+            ),
+            (
+                "long_text",
+                _raw(
+                    event_type="m.room.message",
+                    room_name="Engineering",
+                    content={"msgtype": "m.text", "body": "status ok " * 600},
+                    default_payload={"pad": "x" * 3000},
+                ),
+            ),
+            (
+                "long_text_forced_to_stock_fallback",
+                _raw(
+                    event_type="m.room.message",
+                    room_name="Engineering",
+                    content={"msgtype": "m.text", "body": "status ok " * 600},
+                    default_payload={"pad": "x" * 3880},
+                ),
+            ),
+        ]
+        for label, raw in cases:
+            with self.subTest(case=label):
+                want = await self._send(raw, stock=True)
+                with patch.object(
+                    apnstruncate, "truncate", wraps=apnstruncate.truncate
+                ) as truncate_spy:
+                    msg = await self._send(raw)
+                self.assertEqual(truncate_spy.call_count, 1)
+                assert msg is not None and want is not None
+                self.assertLessEqual(_json_size(msg), 4096)
+                alert = msg["aps"]["alert"]
+                if label.endswith("stock_fallback"):
+                    self.assertEqual(msg, want)
+                else:
+                    preview = alert["body"] if "body" in alert else max(alert["loc-args"], key=len)
+                    self.assertGreaterEqual(len(preview.encode("utf-8")), MIN_PREVIEW_BYTES)
+                    self.assertEqual(msg["sender"], "@alice:example.com")
+
+    async def test_lone_surrogates_never_drop_a_push(self) -> None:
+        bad = "\ud83d"
+        # (label, broken _raw kwargs, metadata key that must carry the replacement character)
+        broken_fields: List[Tuple[str, Dict[str, Any], str]] = [
+            ("sender", {"sender": f"@al{bad}ice:example.com"}, "sender"),
+            (
+                "sender_without_display_name",
+                {"sender": f"@al{bad}ice:example.com", "sender_display_name": None},
+                "sender",
+            ),
+            ("sender_display_name", {"sender_display_name": f"Al{bad}ice"}, "sender_display_name"),
+            ("room_name", {"room_name": f"Eng{bad}ineering"}, "room_name"),
+            ("room_alias", {"room_alias": f"#eng{bad}:example.com"}, "room_name"),
+        ]
+        events: List[Tuple[str, Dict[str, Any]]] = [
+            ("text", {"event_type": "m.room.message", "content": {"msgtype": "m.text", "body": "**Hello**"}}),
+            ("text_broken_body", {"event_type": "m.room.message", "content": {"msgtype": "m.text", "body": f"He{bad}llo"}}),
+            ("emote", {"event_type": "m.room.message", "content": {"msgtype": "m.emote", "body": f"wa{bad}ves"}}),
+            ("image", {"event_type": "m.room.message", "content": {"msgtype": "m.image", "body": f"sun{bad}set.jpg"}}),
+            ("encrypted", {"event_type": ENCRYPTED_EVENT_TYPE, "content": {"algorithm": "m.megolm.v1.aes-sha2"}}),
+            ("invite", {"event_type": "m.room.member", "user_is_target": True, "membership": "invite"}),
+            ("legacy_call_invite", {"event_type": "m.call.invite", "content": {}}),
+            ("ring", {"content": _ring(self.now_ms), "tweaks": {"sound": "ring"}}),
+        ]
+        for field_label, broken, metadata_key in broken_fields:
+            for event_label, event in events:
+                with self.subTest(field=field_label, event=event_label):
+                    msg = await self._send(_raw(**{**event, **broken}))
+                    assert msg is not None
+                    # aioapns must be able to UTF-8 encode what we hand it.
+                    encoded = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+                    self.assertLessEqual(len(encoded), 4096)
+                    if event_label != "ring":
+                        self.assertIn("\ufffd", msg[metadata_key])
+        # Stock delivers a broken sender ID when a display name exists, so we must too.
+        stock_msg = await self._send(
+            _raw(
+                event_type="m.room.message",
+                sender=f"@al{bad}ice:example.com",
+                content={"msgtype": "m.text", "body": "Hello"},
+            ),
+            stock=True,
+        )
+        assert stock_msg is not None
+        json.dumps(stock_msg, ensure_ascii=False).encode("utf-8")
 
     async def test_expiry_and_retries(self) -> None:
         # 1. Expired at payload build time -> returns None (skips truncation, no BodyTooLong)

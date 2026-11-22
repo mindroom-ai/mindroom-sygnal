@@ -6,9 +6,11 @@ APNs pushkin add-on for [Sygnal](https://github.com/element-hq/sygnal) `v0.17.0`
 
 - Subclasses Sygnal `v0.17.0`'s `ApnsPushkin` as `mindroom_pushkin.MindroomApnsPushkin`.
 - **Rich iOS notifications** for alert-bearing non-ring events:
-  - Replaces `aps.alert` on `m.room.message` (`m.text` and `m.notice`) with structured `title`, optional `subtitle` (when the room name differs from the sender), and Markdown-stripped `body` (dropping any `default_payload.aps.alert` keys), falling back to stock `MSG_FROM_USER` / `MSG_FROM_USER_IN_ROOM` if the cleaned body is empty.
+  - Replaces `aps.alert` on `m.room.message` (`m.text` and `m.notice`) with structured `title`, optional `subtitle` (when the room name differs from the sender), and Markdown-stripped `body` (dropping any `default_payload.aps.alert` keys), and marks the payload with top-level `mindroom_plain: 1` so the iOS extension does not strip the preview a second time; falls back to stock `MSG_FROM_USER` / `MSG_FROM_USER_IN_ROOM` if the cleaned body is empty.
   - Strips Markdown (including Matrix rich-reply fallbacks and MindRoom tool-call marker lines) from text, notice, and `m.emote` bodies while preserving code blocks and identifiers.
-  - Sets `aps.mutable-content = 1`, `aps.thread-id` from `room_id`, and UTF-8-bounded top-level `sender`, `sender_display_name`, and `room_name` metadata for the iOS `UNNotificationServiceExtension` (overwriting or clearing caller-supplied values).
+  - Sets `aps.mutable-content = 1`, `aps.thread-id` from `room_id`, and UTF-8-bounded top-level `sender`, `sender_display_name`, and `room_name` metadata for the iOS `UNNotificationServiceExtension`.
+  - Treats those fields, `mindroom_ring`, `mindroom_plain`, and the `aps.alert` title/subtitle keys as gateway-owned: values supplied through the pusher's `default_payload` are removed from every event-generated alert.
+  - Stays within the APNs 4096-byte limit without erasing the preview: if Sygnal's truncation could not keep at least 64 bytes of each preview string, the payload drops `sender_display_name`, `room_name`, and `subtitle`; if that is still too large, it sends the stock payload minus the gateway-owned fields.
 - **Incoming call rings** (recognized only when all three hold):
   1. The homeserver set the `sound: "ring"` tweak.
   2. The wire type matches either `org.matrix.msc4075.rtc.notification` (top-level ring fields) or `m.room.encrypted` (cleartext `io.mindroom.rtc.notification` hint).

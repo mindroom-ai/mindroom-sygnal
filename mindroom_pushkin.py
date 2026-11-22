@@ -27,9 +27,7 @@ from aioapns import NotificationRequest
 from aioapns.common import NotificationResult
 from opentracing import Span
 
-from sygnal import apnstruncate
 from sygnal.apnspushkin import ApnsPushkin
-from sygnal.apnstruncate import BodyTooLongException
 from sygnal.notifications import Device, Notification
 from sygnal.utils import NotificationLoggerAdapter
 
@@ -43,6 +41,28 @@ RING_HINT_KEY = "io.mindroom.rtc.notification"
 RING_TWEAK_SOUND = "ring"
 RING_SOUND = "ring.wav"
 RING_PAYLOAD_KEY = "mindroom_ring"
+# Marks ``aps.alert.body`` as already Markdown-stripped by this gateway, so the
+# iOS notification service extension must not strip it a second time.
+PLAIN_PAYLOAD_KEY = "mindroom_plain"
+
+# Fields only this gateway may set on an event-generated alert. Values supplied
+# through the pusher's ``default_payload`` are removed before anything else.
+_RESERVED_PAYLOAD_KEYS = (
+    "sender",
+    "sender_display_name",
+    "room_name",
+    RING_PAYLOAD_KEY,
+    PLAIN_PAYLOAD_KEY,
+)
+_RESERVED_APS_KEYS = ("thread-id", "mutable-content")
+_RESERVED_ALERT_KEYS = (
+    "title",
+    "subtitle",
+    "title-loc-key",
+    "title-loc-args",
+    "subtitle-loc-key",
+    "subtitle-loc-args",
+)
 
 MAX_RING_LIFETIME_MS = 120_000
 MAX_CLOCK_SKEW_MS = 20_000
@@ -55,8 +75,12 @@ MAX_THREAD_ID_BYTES = 256
 MAX_SENDER_BYTES = 256
 MAX_SENDER_DISPLAY_NAME_BYTES = 128
 MAX_ROOM_NAME_BYTES = 128
+# Gateway metadata is only kept while Sygnal's truncation leaves at least this
+# many UTF-8 bytes (16 characters or more) of every preview string.
+MIN_PREVIEW_BYTES = 64
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _REPLY_FALLBACK_RE = re.compile(
     r"\A> (?:\* )?<@[^\n]*\n(?:>(?: [^\n]*)?\n)*[ \t]*\n"
 )
@@ -100,15 +124,32 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _scrub_surrogates(text: str) -> str:
+    """Replace lone UTF-16 surrogates, which cannot be UTF-8 encoded, with U+FFFD."""
+    return _LONE_SURROGATE_RE.sub("\ufffd", text)
+
+
+def _json_size(payload: Dict[str, Any]) -> int:
+    """Return the size Sygnal measures for ``payload``; never raises on lone surrogates."""
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+
+
 def _json_str_bytes(text: str) -> int:
     """Return UTF-8 byte length of ``text`` inside a JSON string (excluding quotes)."""
     return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _preview_floor(text: str) -> str:
+    """Return the longest prefix of ``text`` within ``MIN_PREVIEW_BYTES`` UTF-8 bytes."""
+    head = text[:MIN_PREVIEW_BYTES].encode("utf-8", "surrogatepass")
+    return head[:MIN_PREVIEW_BYTES].decode("utf-8", "ignore")
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> str:
     """Truncate ``text`` cleanly on a Unicode boundary to ``max_bytes`` JSON UTF-8 bytes."""
     if max_bytes <= 0 or not text:
         return ""
+    text = _scrub_surrogates(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes and _json_str_bytes(text) <= max_bytes:
         return text
@@ -126,10 +167,10 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
 
 
 def _clean_display_field(value: Any) -> Optional[str]:
-    """Sanitize C0/DEL control characters in display/room names."""
+    """Sanitize C0/DEL control characters and lone surrogates in display/room names."""
     if not isinstance(value, str) or not value:
         return None
-    cleaned = _CONTROL_CHARS_RE.sub(" ", value).strip()
+    cleaned = _CONTROL_CHARS_RE.sub(" ", _scrub_surrogates(value)).strip()
     return cleaned or None
 
 
@@ -201,12 +242,13 @@ def _split_table_cells(row_inner: str) -> List[str]:
 
 
 def _strip_inline_markdown(line: str) -> str:
-    """Strip inline Markdown syntax from a single non-code line."""
+    """Strip inline Markdown from a non-code line and collapse its prose whitespace."""
     used_chars = set(line)
     next_pua = _PUA_START
-    placeholders: Dict[str, str] = {}
+    code_literals: Dict[str, str] = {}
+    math_literals: Dict[str, str] = {}
 
-    def _alloc(literal: str) -> Optional[str]:
+    def _alloc(literals: Dict[str, str], literal: str) -> Optional[str]:
         nonlocal next_pua
         while next_pua <= _PUA_END and chr(next_pua) in used_chars:
             next_pua += 1
@@ -214,7 +256,7 @@ def _strip_inline_markdown(line: str) -> str:
             return None
         token = chr(next_pua)
         next_pua += 1
-        placeholders[token] = literal
+        literals[token] = literal
         return token
 
     code_spans = _find_code_spans(line)
@@ -224,7 +266,7 @@ def _strip_inline_markdown(line: str) -> str:
         for start, end, content in code_spans:
             if start > pos:
                 parts.append(line[pos:start])
-            token = _alloc(content)
+            token = _alloc(code_literals, content)
             parts.append(token if token is not None else content)
             pos = end
         if pos < len(line):
@@ -233,7 +275,7 @@ def _strip_inline_markdown(line: str) -> str:
 
     if "$" in line:
         def _protect_math(match: "re.Match[str]") -> str:
-            token = _alloc(match.group(0))
+            token = _alloc(math_literals, match.group(0))
             return token if token is not None else match.group(0)
 
         line = _DISPLAY_MATH_RE.sub(_protect_math, line)
@@ -245,9 +287,13 @@ def _strip_inline_markdown(line: str) -> str:
     line = _BOLD_RE.sub(r"\1", line)
     line = _ITALIC_RE.sub(r"\1", line)
     line = _STRIKETHROUGH_RE.sub(r"\1", line)
+    # Collapse whitespace while code and math are still tokens, keeping theirs literal.
+    line = _HORIZONTAL_WS_RE.sub(" ", line)
 
-    if placeholders:
-        line = line.translate(str.maketrans(placeholders))
+    # A math literal can hold code tokens, so restore in reverse protection order.
+    for literals in (math_literals, code_literals):
+        if literals:
+            line = line.translate(str.maketrans(literals))
     return line
 
 
@@ -312,7 +358,7 @@ def strip_markdown(text: str) -> str:
         if _TABLE_ROW_RE.match(trimmed):
             cells: List[str] = []
             for raw_cell in _split_table_cells(trimmed[1:-1]):
-                cell = _HORIZONTAL_WS_RE.sub(" ", _strip_inline_markdown(raw_cell)).strip()
+                cell = _strip_inline_markdown(raw_cell).strip()
                 if cell:
                     cells.append(cell)
             if cells:
@@ -322,15 +368,14 @@ def strip_markdown(text: str) -> str:
             continue
         line = _ATX_HEADING_RE.sub("", line)
         line = _UNORDERED_LIST_RE.sub("• ", line)
-        line = _strip_inline_markdown(line)
-        cleaned = _HORIZONTAL_WS_RE.sub(" ", line).strip()
+        cleaned = _strip_inline_markdown(line).strip()
         if cleaned:
             out.append(cleaned)
 
     result = "\n".join(out)
     if len(result) > MAX_STRIP_CHARS:
         result = result[:MAX_STRIP_CHARS].rstrip(" \t\n")
-    return result
+    return _scrub_surrogates(result)
 
 
 def _sygnal_generates_alert(n: Notification) -> bool:
@@ -387,17 +432,45 @@ class MindroomApnsPushkin(ApnsPushkin):
         )
         self._request_deadlines: Dict[str, int] = {}
 
-    def _fits_apns_limit(self, payload: Dict[str, Any]) -> bool:
-        """Return True iff ``payload`` fits within APNs limits after truncation."""
-        if not apnstruncate.is_too_long(payload, self.MAX_JSON_BODY_SIZE):
-            return True
-        try:
-            apnstruncate.truncate(
-                copy.deepcopy(payload), max_length=self.MAX_JSON_BODY_SIZE
-            )
-            return True
-        except BodyTooLongException:
-            return False
+    @staticmethod
+    def _sanitize_event_alert(payload: Dict[str, Any], aps: Dict[str, Any]) -> None:
+        """Drop caller-supplied gateway-owned fields and make ``loc-args`` encodable."""
+        for key in _RESERVED_PAYLOAD_KEYS:
+            payload.pop(key, None)
+        for key in _RESERVED_APS_KEYS:
+            aps.pop(key, None)
+        alert = aps["alert"]
+        for key in _RESERVED_ALERT_KEYS:
+            alert.pop(key, None)
+        loc_args = alert.get("loc-args")
+        if isinstance(loc_args, list):
+            alert["loc-args"] = [
+                _scrub_surrogates(arg) if isinstance(arg, str) else arg
+                for arg in loc_args
+            ]
+
+    def _fits_with_preview(self, payload: Dict[str, Any]) -> bool:
+        """Return True iff Sygnal can fit ``payload`` without erasing its preview.
+
+        Sygnal shortens ``alert.body`` and ``alert.loc-args``, longest first,
+        until the payload fits, so none of them ends up shorter than its
+        ``MIN_PREVIEW_BYTES`` prefix if the payload fits with all of them cut
+        to that prefix. That takes one size measurement instead of a truncation.
+        """
+        aps = payload["aps"]
+        alert = aps["alert"]
+        body = alert.get("body", "")
+        loc_args = alert.get("loc-args", [])
+        choppable = [body, *loc_args] if isinstance(loc_args, list) else [None]
+        # Sygnal can only shorten strings; any other alert has to fit as it is.
+        if all(isinstance(text, str) for text in choppable):
+            floor = dict(alert)
+            if "body" in alert:
+                floor["body"] = _preview_floor(body)
+            if "loc-args" in alert:
+                floor["loc-args"] = [_preview_floor(arg) for arg in loc_args]
+            payload = {**payload, "aps": {**aps, "alert": floor}}
+        return _json_size(payload) <= self.MAX_JSON_BODY_SIZE
 
     @staticmethod
     def _fallback_localized_alert(
@@ -449,6 +522,7 @@ class MindroomApnsPushkin(ApnsPushkin):
                             room_display, MAX_ALERT_SUBTITLE_BYTES
                         )
                     aps["alert"] = alert
+                    payload[PLAIN_PAYLOAD_KEY] = 1
                 else:
                     aps["alert"] = self._fallback_localized_alert(
                         from_display, room_display
@@ -473,25 +547,14 @@ class MindroomApnsPushkin(ApnsPushkin):
         aps["mutable-content"] = 1
         if isinstance(n.room_id, str) and n.room_id:
             aps["thread-id"] = _truncate_utf8(n.room_id, MAX_THREAD_ID_BYTES)
-        else:
-            aps.pop("thread-id", None)
-
         if sender_id is not None:
             payload["sender"] = _truncate_utf8(sender_id, MAX_SENDER_BYTES)
-        else:
-            payload.pop("sender", None)
-
         if sender_display_name is not None:
             payload["sender_display_name"] = _truncate_utf8(
                 sender_display_name, MAX_SENDER_DISPLAY_NAME_BYTES
             )
-        else:
-            payload.pop("sender_display_name", None)
-
         if room_display is not None:
             payload["room_name"] = _truncate_utf8(room_display, MAX_ROOM_NAME_BYTES)
-        else:
-            payload.pop("room_name", None)
 
     def _get_payload_full(
         self,
@@ -507,7 +570,7 @@ class MindroomApnsPushkin(ApnsPushkin):
         if (
             not _sygnal_generates_alert(n)
             or not isinstance(aps, dict)
-            or "alert" not in aps
+            or not isinstance(aps.get("alert"), dict)
         ):
             return payload
 
@@ -519,7 +582,9 @@ class MindroomApnsPushkin(ApnsPushkin):
                 log.info("Dropping expired ring notification (expires_at=%d)", expires_at)
                 return None
 
-            name = (n.sender_display_name or n.sender or " ")[: self.MAX_FIELD_LENGTH]
+            name = _scrub_surrogates(
+                (n.sender_display_name or n.sender or " ")[: self.MAX_FIELD_LENGTH]
+            )
             is_video = ring.get("m.call.intent") == "video"
             aps["alert"] = {
                 "loc-key": "VIDEO_CALL_FROM_USER" if is_video else "VOICE_CALL_FROM_USER",
@@ -530,17 +595,18 @@ class MindroomApnsPushkin(ApnsPushkin):
             self._dispatch_deadlines[log] = expires_at
             return payload
 
+        # Sanitize before the snapshot so the fallback cannot restore spoofed fields.
+        self._sanitize_event_alert(payload, aps)
         stock_payload = copy.deepcopy(payload)
+
         self._enrich_alert_payload(n, payload, aps)
-        if self._fits_apns_limit(payload):
+        if self._fits_with_preview(payload):
             return payload
 
         payload.pop("sender_display_name", None)
         payload.pop("room_name", None)
-        alert = aps.get("alert")
-        if isinstance(alert, dict):
-            alert.pop("subtitle", None)
-        if self._fits_apns_limit(payload):
+        aps["alert"].pop("subtitle", None)
+        if self._fits_with_preview(payload):
             return payload
 
         return stock_payload
