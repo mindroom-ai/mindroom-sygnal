@@ -1,5 +1,5 @@
 {
-  description = "Sygnal v0.17.0 APNs pushkin add-on for MindRoom incoming-call rings";
+  description = "Sygnal v0.17.0 APNs pushkin add-on for MindRoom rich iOS notifications and incoming-call rings";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
