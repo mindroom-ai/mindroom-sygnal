@@ -41,8 +41,9 @@ RING_HINT_KEY = "io.mindroom.rtc.notification"
 RING_TWEAK_SOUND = "ring"
 RING_SOUND = "ring.wav"
 RING_PAYLOAD_KEY = "mindroom_ring"
-# Marks ``aps.alert.body`` as already Markdown-stripped by this gateway, so the
-# iOS notification service extension must not strip it a second time.
+# Marks the alert's preview (``aps.alert.body``, or the ``m.emote`` action text in
+# ``loc-args``) as already Markdown-stripped by this gateway, so the iOS
+# notification service extension must not strip it a second time.
 PLAIN_PAYLOAD_KEY = "mindroom_plain"
 
 # Fields only this gateway may set on an event-generated alert. Values supplied
@@ -55,7 +56,10 @@ _RESERVED_PAYLOAD_KEYS = (
     PLAIN_PAYLOAD_KEY,
 )
 _RESERVED_APS_KEYS = ("thread-id", "mutable-content")
+# Sygnal builds event alerts from ``loc-key``/``loc-args`` only, so a ``body``
+# present before enrichment can only have come from ``default_payload``.
 _RESERVED_ALERT_KEYS = (
+    "body",
     "title",
     "subtitle",
     "title-loc-key",
@@ -246,7 +250,8 @@ def _strip_inline_markdown(line: str) -> str:
     used_chars = set(line)
     next_pua = _PUA_START
     code_literals: Dict[str, str] = {}
-    math_literals: Dict[str, str] = {}
+    display_math_literals: Dict[str, str] = {}
+    inline_math_literals: Dict[str, str] = {}
 
     def _alloc(literals: Dict[str, str], literal: str) -> Optional[str]:
         nonlocal next_pua
@@ -274,12 +279,16 @@ def _strip_inline_markdown(line: str) -> str:
         line = "".join(parts)
 
     if "$" in line:
-        def _protect_math(match: "re.Match[str]") -> str:
-            token = _alloc(math_literals, match.group(0))
+        def _protect_math(literals: Dict[str, str], match: "re.Match[str]") -> str:
+            token = _alloc(literals, match.group(0))
             return token if token is not None else match.group(0)
 
-        line = _DISPLAY_MATH_RE.sub(_protect_math, line)
-        line = _INLINE_MATH_RE.sub(_protect_math, line)
+        line = _DISPLAY_MATH_RE.sub(
+            lambda match: _protect_math(display_math_literals, match), line
+        )
+        line = _INLINE_MATH_RE.sub(
+            lambda match: _protect_math(inline_math_literals, match), line
+        )
 
     line = _IMAGE_RE.sub(r"\1", line)
     line = _LINK_RE.sub(r"\1", line)
@@ -290,8 +299,9 @@ def _strip_inline_markdown(line: str) -> str:
     # Collapse whitespace while code and math are still tokens, keeping theirs literal.
     line = _HORIZONTAL_WS_RE.sub(" ", line)
 
-    # A math literal can hold code tokens, so restore in reverse protection order.
-    for literals in (math_literals, code_literals):
+    # A literal can hold tokens of every layer protected before it (inline math
+    # wraps display math wraps code), so restore in reverse protection order.
+    for literals in (inline_math_literals, display_math_literals, code_literals):
         if literals:
             line = line.translate(str.maketrans(literals))
     return line
@@ -433,10 +443,15 @@ class MindroomApnsPushkin(ApnsPushkin):
         self._request_deadlines: Dict[str, int] = {}
 
     @staticmethod
-    def _sanitize_event_alert(payload: Dict[str, Any], aps: Dict[str, Any]) -> None:
+    def _sanitize_event_alert(
+        n: Notification, payload: Dict[str, Any], aps: Dict[str, Any]
+    ) -> None:
         """Drop caller-supplied gateway-owned fields and make ``loc-args`` encodable."""
         for key in _RESERVED_PAYLOAD_KEYS:
             payload.pop(key, None)
+        if not n.room_id:
+            # Sygnal only writes room_id when the homeserver sent one.
+            payload.pop("room_id", None)
         for key in _RESERVED_APS_KEYS:
             aps.pop(key, None)
         alert = aps["alert"]
@@ -539,6 +554,7 @@ class MindroomApnsPushkin(ApnsPushkin):
                         and alert_obj["loc-args"]
                     ):
                         alert_obj["loc-args"][-1] = clean_body
+                        payload[PLAIN_PAYLOAD_KEY] = 1
                 else:
                     aps["alert"] = self._fallback_localized_alert(
                         from_display, room_display
@@ -596,7 +612,7 @@ class MindroomApnsPushkin(ApnsPushkin):
             return payload
 
         # Sanitize before the snapshot so the fallback cannot restore spoofed fields.
-        self._sanitize_event_alert(payload, aps)
+        self._sanitize_event_alert(n, payload, aps)
         stock_payload = copy.deepcopy(payload)
 
         self._enrich_alert_payload(n, payload, aps)

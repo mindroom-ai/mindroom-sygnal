@@ -145,12 +145,14 @@ SPOOFED_DEFAULT_PAYLOAD: Dict[str, Any] = {
     "room_name": "Spoofed Room",
     RING_PAYLOAD_KEY: {"expires_at": 1, "spoof": True},
     PLAIN_PAYLOAD_KEY: "spoof",
+    "room_id": "!spoof:evil.example",
     "custom": "kept",
     "aps": {
         "mutable-content": 0,
         "thread-id": "!spoof:evil.example",
         "sound": "default",
         "alert": {
+            "body": "Spoofed body",
             "title": "Spoofed Title",
             "subtitle": "Spoofed Subtitle",
             "title-loc-key": "SPOOF_TITLE",
@@ -173,14 +175,19 @@ def _json_size(message: Dict[str, Any]) -> int:
     return len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
 
 
-def _without_reserved_fields(stock_payload: Dict[str, Any]) -> Dict[str, Any]:
+def _without_reserved_fields(
+    stock_payload: Dict[str, Any], *, homeserver_sent_room_id: bool = True
+) -> Dict[str, Any]:
     """Return a stock payload minus every gateway-owned field."""
     payload = copy.deepcopy(stock_payload)
     for key in ("sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY):
         payload.pop(key, None)
+    if not homeserver_sent_room_id:
+        payload.pop("room_id", None)
     for key in ("thread-id", "mutable-content"):
         payload["aps"].pop(key, None)
     for key in (
+        "body",
         "title",
         "subtitle",
         "title-loc-key",
@@ -355,6 +362,9 @@ class StripMarkdownTestCase(unittest.TestCase):
                 "  🔧 `shell` [1]",
                 "🔧 shell [1]",
             ),
+            ("inline_math_wrapping_display_math", "$a $$b$$ c$", "$a $$b$$ c$"),
+            ("triple_dollar_math", "$$$x$$$", "$$$x$$$"),
+            ("inline_math_wrapping_display_math_and_code", "$a $$`b`$$ c$", "$a $$b$$ c$"),
             ("math_wrapping_inline_code", "$`total`$", "$total$"),
             ("math_containing_inline_code", "Math $`x` + 1$", "Math $x + 1$"),
             (
@@ -375,6 +385,21 @@ class StripMarkdownTestCase(unittest.TestCase):
         for label, raw, expected in cases:
             with self.subTest(case=label):
                 self.assertEqual(strip_markdown(raw), expected)
+
+    def test_nested_math_and_code_never_leak_placeholders(self) -> None:
+        for raw in (
+            "$a $$b$$ c$",
+            "$$$x$$$",
+            "$a $$`b`$$ c$",
+            "$`total`$",
+            "Math $`x` + 1$",
+            "| $a $$b$$ c$ | $$$x$$$ |",
+        ):
+            with self.subTest(raw=raw):
+                stripped = strip_markdown(raw)
+                self.assertFalse(
+                    any("\ue000" <= char <= "\uf8ff" for char in stripped), repr(stripped)
+                )
 
     def test_pathological_inputs_are_fast_and_bounded(self) -> None:
         patterns = [
@@ -877,6 +902,15 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 ),
                 {"loc-key": "ACTION_FROM_USER", "loc-args": ["Alice", "celebrates v1.0!"]},
             ),
+            (
+                # Stripping this a second time on the device would eat the asterisks.
+                "emote_inline_code_kept_literal",
+                _raw(
+                    event_type="m.room.message",
+                    content={"msgtype": "m.emote", "body": "tests `**kwargs**`"},
+                ),
+                {"loc-key": "ACTION_FROM_USER", "loc-args": ["Alice", "tests **kwargs**"]},
+            ),
         ]
         for label, raw, expected_alert in cases:
             with self.subTest(case=label):
@@ -884,10 +918,27 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self._dispatch(Notification(raw)), [])
                 msg = self.sent[APP_ID][0].message
                 self.assertEqual(msg["aps"]["alert"], expected_alert)
-                self.assertNotIn(PLAIN_PAYLOAD_KEY, msg)
+                self.assertEqual(msg[PLAIN_PAYLOAD_KEY], 1)
                 self.assertEqual(msg["aps"]["mutable-content"], 1)
                 self.assertEqual(msg["aps"]["thread-id"], "!room:example.com")
                 self.assertEqual(msg["sender"], "@alice:example.com")
+
+        # Forced to the stock fallback, the action text is neither stripped nor marked.
+        def _emote(pad: int) -> Dict[str, Any]:
+            return _raw(
+                event_type="m.room.message",
+                content={"msgtype": "m.emote", "body": "tests `**kwargs**`"},
+                default_payload={"pad": "x" * pad},
+            )
+
+        raw = _emote(4096 - _json_size(self._stock_payload(_emote(0))))
+        want = await self._send(raw, stock=True)
+        got = await self._send(raw)
+        assert want is not None and got is not None
+        self.assertEqual(_json_size(want), 4096)
+        self.assertEqual(got, want)
+        self.assertEqual(got["aps"]["alert"]["loc-args"], ["Alice", "tests `**kwargs**`"])
+        self.assertNotIn(PLAIN_PAYLOAD_KEY, got)
 
     async def test_non_text_alerts_receive_extension_metadata(self) -> None:
         cases = [
@@ -1101,24 +1152,25 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msg_absent["aps"]["mutable-content"], 1)
 
     async def test_reserved_fields_sanitized_on_every_event_alert(self) -> None:
-        # (label, event type, content, extra _raw kwargs, gateway-stripped structured body?)
-        events: List[Tuple[str, str, Optional[Dict[str, Any]], Dict[str, Any], bool]] = [
-            ("text", "m.room.message", {"msgtype": "m.text", "body": "**Hello**"}, {}, True),
-            ("notice", "m.room.message", {"msgtype": "m.notice", "body": "**Hello**"}, {}, True),
-            ("text_empty_after_strip", "m.room.message", {"msgtype": "m.text", "body": "---"}, {}, False),
-            ("emote", "m.room.message", {"msgtype": "m.emote", "body": "**waves**"}, {}, False),
-            ("emote_empty_after_strip", "m.room.message", {"msgtype": "m.emote", "body": "---"}, {}, False),
-            ("image", "m.room.message", {"msgtype": "m.image", "body": "sunset.jpg"}, {}, False),
-            ("encrypted", ENCRYPTED_EVENT_TYPE, {"algorithm": "m.megolm.v1.aes-sha2"}, {}, False),
-            ("invite", "m.room.member", None, {"user_is_target": True, "membership": "invite"}, False),
-            ("legacy_call_invite", "m.call.invite", {"offer": {"sdp": "v=0\r\nm=audio 9\r\n"}}, {}, False),
-            ("unknown_type", "com.example.custom", {"x": 1}, {}, False),
+        # (label, event type, content, extra _raw kwargs, alert kind), where the kind is
+        # "structured" (stripped title/body alert), "stripped_emote" or "localized".
+        events: List[Tuple[str, str, Optional[Dict[str, Any]], Dict[str, Any], str]] = [
+            ("text", "m.room.message", {"msgtype": "m.text", "body": "**Hello**"}, {}, "structured"),
+            ("notice", "m.room.message", {"msgtype": "m.notice", "body": "**Hello**"}, {}, "structured"),
+            ("text_empty_after_strip", "m.room.message", {"msgtype": "m.text", "body": "---"}, {}, "localized"),
+            ("emote", "m.room.message", {"msgtype": "m.emote", "body": "**waves**"}, {}, "stripped_emote"),
+            ("emote_empty_after_strip", "m.room.message", {"msgtype": "m.emote", "body": "---"}, {}, "localized"),
+            ("image", "m.room.message", {"msgtype": "m.image", "body": "sunset.jpg"}, {}, "localized"),
+            ("encrypted", ENCRYPTED_EVENT_TYPE, {"algorithm": "m.megolm.v1.aes-sha2"}, {}, "localized"),
+            ("invite", "m.room.member", None, {"user_is_target": True, "membership": "invite"}, "localized"),
+            ("legacy_call_invite", "m.call.invite", {"offer": {"sdp": "v=0\r\nm=audio 9\r\n"}}, {}, "localized"),
+            ("unknown_type", "com.example.custom", {"x": 1}, {}, "localized"),
         ]
         identities: List[Tuple[str, Dict[str, Any]]] = [
             ("present", REAL_IDENTITY),
             ("absent", {key: None for key in REAL_IDENTITY}),
         ]
-        for label, event_type, content, extra, is_plain in events:
+        for label, event_type, content, extra, kind in events:
             for identity_label, identity in identities:
                 with self.subTest(case=label, identity=identity_label):
                     msg = await self._send(
@@ -1133,8 +1185,9 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                     assert msg is not None
                     self.assertNotIn("spoof", json.dumps(msg).lower())
                     self.assertNotIn(RING_PAYLOAD_KEY, msg)
-                    self.assertEqual(msg.get(PLAIN_PAYLOAD_KEY), 1 if is_plain else None)
+                    self.assertEqual(msg.get(PLAIN_PAYLOAD_KEY), None if kind == "localized" else 1)
                     self.assertEqual(msg["custom"], "kept")
+                    self.assertEqual(msg.get("room_id"), identity["room_id"])
                     self.assertEqual(msg.get("sender"), identity["sender"])
                     self.assertEqual(msg.get("sender_display_name"), identity["sender_display_name"])
                     self.assertEqual(msg.get("room_name"), identity["room_name"])
@@ -1143,14 +1196,72 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(aps["mutable-content"], 1)
                     self.assertEqual(aps.get("thread-id"), identity["room_id"])
                     alert = aps["alert"]
-                    if is_plain:
+                    if kind == "structured":
                         self.assertEqual(alert["title"], identity["sender_display_name"] or " ")
                         self.assertEqual(alert.get("subtitle"), identity["room_name"])
                         self.assertEqual(alert["body"], "Hello")
                     else:
                         self.assertIn("loc-key", alert)
+                        self.assertNotIn("body", alert)
                         self.assertNotIn("title", alert)
                         self.assertNotIn("subtitle", alert)
+                    if kind == "stripped_emote":
+                        self.assertEqual(alert["loc-args"][-1], "waves")
+
+    async def test_caller_alert_body_and_room_id_are_not_trusted(self) -> None:
+        default_payload = {
+            "room_id": "!spoof:evil.example",
+            "aps": {"alert": {"body": "Spoofed body"}},
+        }
+        events: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = [
+            (
+                "image",
+                "m.room.message",
+                {"msgtype": "m.image", "body": "sunset.jpg"},
+                {"loc-key": "IMAGE_FROM_USER_IN_ROOM", "loc-args": ["Alice", "sunset.jpg", "Photos"]},
+            ),
+            (
+                "encrypted",
+                ENCRYPTED_EVENT_TYPE,
+                {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque"},
+                {"loc-key": "MSG_FROM_USER_IN_ROOM", "loc-args": ["Alice", "Photos"]},
+            ),
+            (
+                "emote",
+                "m.room.message",
+                {"msgtype": "m.emote", "body": "**waves**"},
+                {"loc-key": "ACTION_FROM_USER_IN_ROOM", "loc-args": ["Photos", "Alice", "waves"]},
+            ),
+            (
+                "text",
+                "m.room.message",
+                {"msgtype": "m.text", "body": "**Hello**"},
+                {"title": "Alice", "subtitle": "Photos", "body": "Hello"},
+            ),
+        ]
+        for label, event_type, content, expected_alert in events:
+            for room_id in ("!room:example.com", None):
+                with self.subTest(case=label, room_id=room_id):
+                    raw = _raw(
+                        event_type=event_type,
+                        room_name="Photos",
+                        room_id=room_id,
+                        content=content,
+                        default_payload=default_payload,
+                    )
+                    # Stock trusts the caller's alert body, and its room_id whenever
+                    # the homeserver sent none.
+                    want = await self._send(raw, stock=True)
+                    assert want is not None
+                    self.assertEqual(want["aps"]["alert"]["body"], "Spoofed body")
+                    self.assertEqual(want["room_id"], room_id or "!spoof:evil.example")
+
+                    got = await self._send(raw)
+                    assert got is not None
+                    self.assertEqual(got["aps"]["alert"], expected_alert)
+                    self.assertEqual(got.get("room_id"), room_id)
+                    self.assertEqual(got["aps"].get("thread-id"), room_id)
+                    self.assertNotIn("spoof", json.dumps(got).lower())
 
     async def test_3872_byte_default_payload_keeps_short_text_preview(self) -> None:
         default_payload = {"custom_data": ""}
@@ -1174,39 +1285,50 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(_json_size(got), 4096)
 
     async def test_forced_fallback_strips_spoofed_reserved_fields(self) -> None:
-        def _spoofed_raw(pad: int) -> Dict[str, Any]:
-            return _raw(
-                event_type="m.room.message",
-                content={"msgtype": "m.text", "body": "**Hello**"},
-                default_payload={**SPOOFED_DEFAULT_PAYLOAD, "pad": "x" * pad},
-                **REAL_IDENTITY,
-            )
+        # The sender ID is only in the enriched payload, and long enough here that the
+        # enriched payload is larger than the stock one even without a thread-id.
+        long_sender = "@" + "r" * 120 + ":example.com"
+        for room_id in (REAL_IDENTITY["room_id"], None):
+            with self.subTest(room_id=room_id):
 
-        # Pad until the stock payload minus the reserved fields exactly fills the APNs
-        # limit, so not a single byte of gateway metadata can be added.
-        pad = 4096 - _json_size(_without_reserved_fields(self._stock_payload(_spoofed_raw(0))))
-        raw = _spoofed_raw(pad)
-        expected = _without_reserved_fields(self._stock_payload(raw))
-        self.assertEqual(_json_size(expected), 4096)
+                def _spoofed_raw(pad: int, room_id: Optional[str] = room_id) -> Dict[str, Any]:
+                    return _raw(
+                        event_type="m.room.message",
+                        content={"msgtype": "m.text", "body": "**Hello**"},
+                        default_payload={**SPOOFED_DEFAULT_PAYLOAD, "pad": "x" * pad},
+                        **{**REAL_IDENTITY, "sender": long_sender, "room_id": room_id},
+                    )
 
-        got = await self._send(raw)
-        assert got is not None
-        self.assertEqual(got, expected)
-        self.assertEqual(
-            got["aps"]["alert"],
-            {
-                "action-loc-key": "OPEN",
-                "loc-key": "MSG_FROM_USER_IN_ROOM_WITH_CONTENT",
-                "loc-args": ["Real User", "Real Room", "**Hello**"],
-            },
-        )
-        self.assertNotIn("spoof", json.dumps(got).lower())
-        for key in ("sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY):
-            self.assertNotIn(key, got)
-        self.assertNotIn("thread-id", got["aps"])
-        self.assertNotIn("mutable-content", got["aps"])
-        # Stock cannot deliver this at all once the spoofed fields are counted.
-        self.assertIsNone(await self._send(raw, stock=True))
+                def _expected(raw: Dict[str, Any], room_id: Optional[str] = room_id) -> Dict[str, Any]:
+                    return _without_reserved_fields(
+                        self._stock_payload(raw), homeserver_sent_room_id=room_id is not None
+                    )
+
+                # Pad until the stock payload minus the reserved fields exactly fills the
+                # APNs limit, so not a single byte of gateway metadata can be added.
+                raw = _spoofed_raw(4096 - _json_size(_expected(_spoofed_raw(0))))
+                expected = _expected(raw)
+                self.assertEqual(_json_size(expected), 4096)
+
+                got = await self._send(raw)
+                assert got is not None
+                self.assertEqual(got, expected)
+                self.assertEqual(
+                    got["aps"]["alert"],
+                    {
+                        "action-loc-key": "OPEN",
+                        "loc-key": "MSG_FROM_USER_IN_ROOM_WITH_CONTENT",
+                        "loc-args": ["Real User", "Real Room", "**Hello**"],
+                    },
+                )
+                self.assertEqual(got.get("room_id"), room_id)
+                self.assertNotIn("spoof", json.dumps(got).lower())
+                for key in ("sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY):
+                    self.assertNotIn(key, got)
+                self.assertNotIn("thread-id", got["aps"])
+                self.assertNotIn("mutable-content", got["aps"])
+                # Stock cannot deliver this at all once the spoofed fields are counted.
+                self.assertIsNone(await self._send(raw, stock=True))
 
     async def test_tight_budgets_keep_preview_and_never_restore_spoofed_fields(self) -> None:
         bodies = [
