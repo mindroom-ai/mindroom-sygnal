@@ -1,16 +1,22 @@
 # mindroom-sygnal
 
-APNs pushkin add-on for [Sygnal](https://github.com/element-hq/sygnal) `v0.17.0` that turns MindRoom incoming-call push notifications into high-priority APNs call alerts with custom ringtone (`ring.wav`) and deadline-bounded expiry.
+APNs pushkin add-on for [Sygnal](https://github.com/element-hq/sygnal) `v0.17.0` providing rich iOS notification formatting (structured alerts, Markdown stripping, thread grouping, and Notification Service Extension metadata) alongside high-priority MindRoom incoming-call alerts with custom ringtone (`ring.wav`) and deadline-bounded expiry.
 
 ## What it does
 
 - Subclasses Sygnal `v0.17.0`'s `ApnsPushkin` as `mindroom_pushkin.MindroomApnsPushkin`.
-- Recognizes incoming call rings only when all three hold:
+- **Rich iOS notifications** for alert-bearing non-ring events:
+  - Replaces `aps.alert` on `m.room.message` (`m.text` and `m.notice`) with structured `title`, optional `subtitle` (when the room name differs from the sender), and Markdown-stripped `body` (dropping any `default_payload.aps.alert` keys), falling back to stock `MSG_FROM_USER` / `MSG_FROM_USER_IN_ROOM` if the cleaned body is empty.
+  - Strips Markdown (including Matrix rich-reply fallbacks and MindRoom tool-call marker lines) from text, notice, and `m.emote` bodies while preserving code blocks and identifiers, and marks every payload whose preview it stripped with top-level `mindroom_plain: 1` so the iOS extension does not strip it a second time.
+  - Sets `aps.mutable-content = 1`, `aps.thread-id` from `room_id`, and UTF-8-bounded top-level `sender`, `sender_display_name`, and `room_name` metadata for the iOS `UNNotificationServiceExtension`.
+  - Treats those fields, `mindroom_ring`, `mindroom_plain`, and the `aps.alert` body/title/subtitle keys as gateway-owned: values supplied through the pusher's `default_payload` are removed from every event-generated alert, as is a `default_payload.room_id` when the homeserver sent no `room_id`.
+  - Stays within the APNs 4096-byte limit without erasing the preview: if Sygnal's truncation could not keep at least 64 bytes of each preview string, the payload drops `sender_display_name`, `room_name`, and `subtitle`; if that is still too large, it sends the stock payload minus the gateway-owned fields.
+- **Incoming call rings** (recognized only when all three hold):
   1. The homeserver set the `sound: "ring"` tweak.
   2. The wire type matches either `org.matrix.msc4075.rtc.notification` (top-level ring fields) or `m.room.encrypted` (cleartext `io.mindroom.rtc.notification` hint).
   3. `notification_type == "ring"` with valid integer `sender_ts > 0`, `lifetime > 0`, and `sender_ts <= now + 20_000`.
-- Rewrites `aps.alert` to `VOICE_CALL_FROM_USER` / `VIDEO_CALL_FROM_USER` with `[sender_display_name]`, sets `aps.sound = "ring.wav"`, enforces APNs high priority (`10`), caps lifetime at 120 s, adds `mindroom_ring.expires_at`, sets `time_to_live` from remaining ring lifetime, and drops expired rings at payload build time and before every APNs attempt (including retries).
-- Leaves legacy `m.call.invite`, group `notification`, `event_id_only`, and all other events identical to stock `ApnsPushkin`.
+  - Rewrites `aps.alert` to `VOICE_CALL_FROM_USER` / `VIDEO_CALL_FROM_USER` with `[sender_display_name]`, sets `aps.sound = "ring.wav"`, enforces APNs high priority (`10`), caps lifetime at 120 s, adds `mindroom_ring.expires_at`, sets `time_to_live` from remaining ring lifetime, and drops expired rings at payload build time and before every APNs attempt (including retries).
+- Leaves badge-only notifications and `event_id_only` payloads identical to stock `ApnsPushkin`.
 
 ## Configuration & fallback
 
