@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 RTC_NOTIFICATION_TYPE = "org.matrix.msc4075.rtc.notification"
 ENCRYPTED_EVENT_TYPE = "m.room.encrypted"
 RING_HINT_KEY = "io.mindroom.rtc.notification"
+TOOL_APPROVAL_TYPE = "io.mindroom.tool_approval"
+REDACTION_EVENT_TYPE = "m.room.redaction"
+_INTERNAL_EVENT_PREFIXES = ("io.mindroom.", "com.mindroom.")
 
 RING_TWEAK_SOUND = "ring"
 RING_SOUND = "ring.wav"
@@ -75,6 +78,7 @@ HIGH_APNS_PRIORITY = 10
 MAX_STRIP_CHARS = 2000
 MAX_ALERT_TITLE_BYTES = 256
 MAX_ALERT_SUBTITLE_BYTES = 256
+MAX_TOOL_APPROVAL_BODY_BYTES = 256
 MAX_THREAD_ID_BYTES = 256
 MAX_SENDER_BYTES = 256
 MAX_SENDER_DISPLAY_NAME_BYTES = 128
@@ -397,6 +401,22 @@ def _sygnal_generates_alert(n: Notification) -> bool:
     return True
 
 
+def _drop_event_reason(n: Notification) -> Optional[str]:
+    """Return a log reason if ``n`` should be dropped without sending a push."""
+    event_type = n.type
+    if not isinstance(event_type, str):
+        return None
+    if event_type == TOOL_APPROVAL_TYPE:
+        if not isinstance(n.content, dict) or n.content.get("status") != "pending":
+            return "non-pending tool approval"
+        return None
+    if event_type == REDACTION_EVENT_TYPE:
+        return "redaction"
+    if event_type.startswith(_INTERNAL_EVENT_PREFIXES):
+        return "internal"
+    return None
+
+
 def ring_of(n: Notification, now: int) -> Optional[Dict[str, Any]]:
     """Return validated ring fields for ``n``, or None if it is not a valid ring."""
     content = n.content
@@ -488,6 +508,21 @@ class MindroomApnsPushkin(ApnsPushkin):
         return _json_size(payload) <= self.MAX_JSON_BODY_SIZE
 
     @staticmethod
+    def _structured_alert(
+        from_display: str, room_display: Optional[str], body: str
+    ) -> Dict[str, Any]:
+        """Build a structured title/subtitle/body APNs alert."""
+        alert: Dict[str, Any] = {
+            "title": _truncate_utf8(from_display, MAX_ALERT_TITLE_BYTES),
+            "body": body,
+        }
+        if room_display and room_display != from_display:
+            alert["subtitle"] = _truncate_utf8(
+                room_display, MAX_ALERT_SUBTITLE_BYTES
+            )
+        return alert
+
+    @staticmethod
     def _fallback_localized_alert(
         from_display: str, room_display: Optional[str]
     ) -> Dict[str, Any]:
@@ -528,15 +563,9 @@ class MindroomApnsPushkin(ApnsPushkin):
             if msgtype in ("m.text", "m.notice") and isinstance(body, str):
                 clean_body = strip_markdown(body)
                 if clean_body:
-                    alert: Dict[str, Any] = {
-                        "title": _truncate_utf8(from_display, MAX_ALERT_TITLE_BYTES),
-                        "body": clean_body,
-                    }
-                    if room_display and room_display != from_display:
-                        alert["subtitle"] = _truncate_utf8(
-                            room_display, MAX_ALERT_SUBTITLE_BYTES
-                        )
-                    aps["alert"] = alert
+                    aps["alert"] = self._structured_alert(
+                        from_display, room_display, clean_body
+                    )
                     payload[PLAIN_PAYLOAD_KEY] = 1
                 else:
                     aps["alert"] = self._fallback_localized_alert(
@@ -559,6 +588,16 @@ class MindroomApnsPushkin(ApnsPushkin):
                     aps["alert"] = self._fallback_localized_alert(
                         from_display, room_display
                     )
+        elif n.type == TOOL_APPROVAL_TYPE and content is not None:
+            tool_name = _clean_display_field(content.get("tool_name"))
+            approval_body = _truncate_utf8(
+                f"Approval needed: {tool_name}" if tool_name else "Approval needed",
+                MAX_TOOL_APPROVAL_BODY_BYTES,
+            )
+            aps["alert"] = self._structured_alert(
+                from_display, room_display, approval_body
+            )
+            payload[PLAIN_PAYLOAD_KEY] = 1
 
         aps["mutable-content"] = 1
         if isinstance(n.room_id, str) and n.room_id:
@@ -579,6 +618,10 @@ class MindroomApnsPushkin(ApnsPushkin):
         log: NotificationLoggerAdapter,
         send_badge_counts: bool,
     ) -> Optional[Dict[str, Any]]:
+        drop_reason = _drop_event_reason(n)
+        if drop_reason is not None:
+            log.info("Dropping %s notification (type=%.128s)", drop_reason, n.type)
+            return None
         payload = super()._get_payload_full(n, device, log, send_badge_counts)
         if payload is None:
             return None

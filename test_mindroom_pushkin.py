@@ -43,12 +43,15 @@ from mindroom_pushkin import (
     MAX_SENDER_BYTES,
     MAX_SENDER_DISPLAY_NAME_BYTES,
     MAX_THREAD_ID_BYTES,
+    MAX_TOOL_APPROVAL_BODY_BYTES,
     MIN_PREVIEW_BYTES,
     PLAIN_PAYLOAD_KEY,
+    REDACTION_EVENT_TYPE,
     RING_HINT_KEY,
     RING_PAYLOAD_KEY,
     RING_SOUND,
     RTC_NOTIFICATION_TYPE,
+    TOOL_APPROVAL_TYPE,
     MindroomApnsPushkin,
     _clean_display_field,
     _truncate_utf8,
@@ -939,6 +942,166 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got, want)
         self.assertEqual(got["aps"]["alert"]["loc-args"], ["Alice", "tests `**kwargs**`"])
         self.assertNotIn(PLAIN_PAYLOAD_KEY, got)
+
+    async def test_internal_and_redaction_events_are_dropped(self) -> None:
+        oversized = {"aps": {"sound": "default"}, "pad": "x" * 5000}
+        cases: List[Tuple[str, str, Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]] = [
+            ("active_runs", "io.mindroom.active_runs", {"runs": []}, None, None),
+            ("background_jobs", "io.mindroom.background_jobs", {"jobs": []}, None, None),
+            ("scheduled_task", "com.mindroom.scheduled.task", {"task_id": "t1"}, None, None),
+            ("tool_approval_response", "io.mindroom.tool_approval_response", {"decision": "approve"}, None, None),
+            ("redaction", REDACTION_EVENT_TYPE, {"redacts": "$evt0"}, {"sound": "ring"}, oversized),
+        ]
+        log = NotificationLoggerAdapter(logging.getLogger(__name__), {"request_id": "req-drop"})
+        for label, event_type, content, tweaks, default_payload in cases:
+            with self.subTest(case=label):
+                self.sent[APP_ID].clear()
+                notif = Notification(
+                    _raw(
+                        event_type=event_type,
+                        room_name="Ops",
+                        content=content,
+                        tweaks=tweaks,
+                        default_payload=default_payload,
+                    )
+                )
+                self.assertIsNone(self.pushkin._get_payload_full(notif, notif.devices[0], log, True))
+                self.assertEqual(await self._dispatch(notif), [])
+                self.assertEqual(self.sent[APP_ID], [])
+
+    async def test_non_pending_tool_approval_is_dropped(self) -> None:
+        cases: List[Tuple[str, Any]] = [
+            ("approved", {"status": "approved", "tool_name": "shell"}),
+            ("denied", {"status": "denied", "tool_name": "shell"}),
+            ("expired", {"status": "expired", "tool_name": "shell"}),
+            ("missing_status", {"tool_name": "shell"}),
+            ("missing_content", None),
+            ("non_dict_content", "pending"),
+        ]
+        log = NotificationLoggerAdapter(logging.getLogger(__name__), {"request_id": "req-approval-drop"})
+        for label, content in cases:
+            with self.subTest(case=label):
+                self.sent[APP_ID].clear()
+                raw = _raw(event_type=TOOL_APPROVAL_TYPE, room_name="Ops")
+                if content is not None:
+                    raw["content"] = content
+                notif = Notification(raw)
+                self.assertIsNone(self.pushkin._get_payload_full(notif, notif.devices[0], log, True))
+                self.assertEqual(await self._dispatch(notif), [])
+                self.assertEqual(self.sent[APP_ID], [])
+
+    async def test_pending_tool_approval_alerts(self) -> None:
+        cases = [
+            (
+                "named_room_with_tool_name",
+                _raw(
+                    event_type=TOOL_APPROVAL_TYPE,
+                    room_name="Ops",
+                    content={"status": "pending", "tool_name": "run_shell"},
+                ),
+                {"title": "Alice", "subtitle": "Ops", "body": "Approval needed: run_shell"},
+                "Ops",
+            ),
+            (
+                "dm_same_room_name_suppresses_subtitle",
+                _raw(
+                    event_type=TOOL_APPROVAL_TYPE,
+                    sender_display_name="Alice",
+                    room_name="Alice",
+                    content={"status": "pending", "tool_name": "read_file"},
+                ),
+                {"title": "Alice", "body": "Approval needed: read_file"},
+                "Alice",
+            ),
+            (
+                "no_room_and_missing_tool_name",
+                _raw(
+                    event_type=TOOL_APPROVAL_TYPE,
+                    content={"status": "pending"},
+                ),
+                {"title": "Alice", "body": "Approval needed"},
+                None,
+            ),
+            (
+                "sanitizes_control_chars_and_surrogates",
+                _raw(
+                    event_type=TOOL_APPROVAL_TYPE,
+                    room_name="Ops",
+                    content={"status": "pending", "tool_name": "run\x01tool\ud83d\n"},
+                    default_payload=SPOOFED_DEFAULT_PAYLOAD,
+                ),
+                {"title": "Alice", "subtitle": "Ops", "body": "Approval needed: run tool\ufffd"},
+                "Ops",
+            ),
+            (
+                "blank_tool_name_falls_back",
+                _raw(
+                    event_type=TOOL_APPROVAL_TYPE,
+                    content={"status": "pending", "tool_name": " \x01\t "},
+                ),
+                {"title": "Alice", "body": "Approval needed"},
+                None,
+            ),
+        ]
+        for label, raw, expected_alert, expected_room_name in cases:
+            with self.subTest(case=label):
+                msg = await self._send(raw)
+                assert msg is not None
+                encoded = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+                self.assertLessEqual(len(encoded), 4096)
+                self.assertNotIn("spoof", encoded.decode("utf-8").lower())
+                self.assertEqual(msg["aps"]["alert"], expected_alert)
+                self.assertEqual(msg[PLAIN_PAYLOAD_KEY], 1)
+                self.assertEqual(msg["aps"]["mutable-content"], 1)
+                self.assertEqual(msg["aps"]["thread-id"], "!room:example.com")
+                self.assertEqual(msg["sender"], "@alice:example.com")
+                self.assertEqual(msg["sender_display_name"], "Alice")
+                self.assertEqual(msg.get("room_name"), expected_room_name)
+
+    async def test_tool_approval_oversized_and_tight_budget_fits_within_4096_bytes(self) -> None:
+        oversized = _raw(
+            event_type=TOOL_APPROVAL_TYPE,
+            sender="@" + "a" * 400 + ":example.com",
+            sender_display_name="😀" * 500,
+            room_name="🔥" * 500,
+            room_id="!" + "b" * 400 + ":example.com",
+            content={"status": "pending", "tool_name": "🔧" * 500},
+        )
+        msg = await self._send(oversized)
+        assert msg is not None
+        self.assertLessEqual(_json_size(msg), 4096)
+        alert = msg["aps"]["alert"]
+        self.assertTrue(alert["body"].startswith("Approval needed: "))
+        self.assertLessEqual(len(alert["body"].encode("utf-8")), MAX_TOOL_APPROVAL_BODY_BYTES)
+        self.assertLessEqual(len(alert["title"].encode("utf-8")), MAX_ALERT_TITLE_BYTES)
+        self.assertLessEqual(len(alert["subtitle"].encode("utf-8")), MAX_ALERT_SUBTITLE_BYTES)
+        self.assertLessEqual(len(msg["sender"].encode("utf-8")), MAX_SENDER_BYTES)
+        self.assertLessEqual(len(msg["room_name"].encode("utf-8")), MAX_ROOM_NAME_BYTES)
+        self.assertEqual(msg[PLAIN_PAYLOAD_KEY], 1)
+        self.assertEqual(msg["aps"]["mutable-content"], 1)
+
+        # Under tight default_payload budgets, shave cleanly across rich -> reduced -> stock.
+        for pad, expected_stage in ((3650, "rich"), (3750, "reduced"), (3900, "stock")):
+            with self.subTest(pad=pad, stage=expected_stage):
+                raw = _raw(
+                    event_type=TOOL_APPROVAL_TYPE,
+                    room_name="Engineering Room",
+                    content={"status": "pending", "tool_name": "run_shell_command_" + "x" * 100},
+                    default_payload={"pad": "x" * pad},
+                )
+                want = await self._send(raw, stock=True)
+                got = await self._send(raw)
+                assert want is not None and got is not None
+                self.assertLessEqual(_json_size(got), 4096)
+                got_alert = got["aps"]["alert"]
+                stage = (
+                    "stock"
+                    if "loc-key" in got_alert
+                    else ("rich" if "room_name" in got else "reduced")
+                )
+                self.assertEqual(stage, expected_stage)
+                if stage != "stock":
+                    self.assertTrue(got_alert["body"].startswith("Approval needed: "))
 
     async def test_non_text_alerts_receive_extension_metadata(self) -> None:
         cases = [
