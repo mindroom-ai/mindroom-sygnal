@@ -14,18 +14,39 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Resilient Sygnal pushkin loader that falls back to stock ApnsPushkin."""
+"""Resilient Sygnal pushkin loaders with fallback to stock APNs/GCM pushkins."""
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Type, TypeVar
 
 from sygnal.apnspushkin import ApnsPushkin
+from sygnal.gcmpushkin import GcmPushkin
 
 if TYPE_CHECKING:
     from sygnal.sygnal import Sygnal
 
 logger = logging.getLogger(__name__)
+_PushkinT = TypeVar("_PushkinT", ApnsPushkin, GcmPushkin)
+
+
+async def _load_pushkin(
+    attr: str, base_cls: Type[_PushkinT], name: str, sygnal: "Sygnal", config: Dict[str, Any]
+) -> _PushkinT:
+    try:
+        mod = importlib.import_module("mindroom_pushkin")
+        pushkin = await getattr(mod, attr).create(name, sygnal, config)
+        if not isinstance(pushkin, base_cls):
+            raise TypeError(f"Expected {base_cls.__name__}, got {type(pushkin)!r}")
+        return pushkin
+    except Exception:
+        logger.exception(
+            "Failed to initialize %s for %s; falling back to stock %s",
+            attr,
+            name,
+            base_cls.__name__,
+        )
+        return await base_cls.create(name, sygnal, config)
 
 
 class SafeApnsPushkin:
@@ -35,16 +56,14 @@ class SafeApnsPushkin:
     async def create(
         cls, name: str, sygnal: "Sygnal", config: Dict[str, Any]
     ) -> ApnsPushkin:
-        try:
-            mod = importlib.import_module("mindroom_pushkin")
-            pushkin_cls = getattr(mod, "MindroomApnsPushkin")
-            pushkin = await pushkin_cls.create(name, sygnal, config)
-            if not isinstance(pushkin, ApnsPushkin):
-                raise TypeError(f"Expected ApnsPushkin, got {type(pushkin)!r}")
-            return pushkin
-        except Exception:
-            logger.exception(
-                "Failed to initialize MindroomApnsPushkin for %s; falling back to stock ApnsPushkin",
-                name,
-            )
-            return await ApnsPushkin.create(name, sygnal, config)
+        return await _load_pushkin("MindroomApnsPushkin", ApnsPushkin, name, sygnal, config)
+
+
+class SafeFcmPushkin:
+    """Factory for MindroomFcmPushkin that falls back to stock GcmPushkin."""
+
+    @classmethod
+    async def create(
+        cls, name: str, sygnal: "Sygnal", config: Dict[str, Any]
+    ) -> GcmPushkin:
+        return await _load_pushkin("MindroomFcmPushkin", GcmPushkin, name, sygnal, config)

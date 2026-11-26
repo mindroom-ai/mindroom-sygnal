@@ -1,34 +1,52 @@
 # mindroom-sygnal
 
-APNs pushkin add-on for [Sygnal](https://github.com/element-hq/sygnal) `v0.17.0` providing rich iOS notification formatting (structured alerts, Markdown stripping, thread grouping, and Notification Service Extension metadata) alongside high-priority MindRoom incoming-call alerts with custom ringtone (`ring.wav`) and deadline-bounded expiry.
+APNs and FCM HTTP v1 pushkin add-ons for [Sygnal](https://github.com/element-hq/sygnal) `v0.17.0` providing rich iOS/Android notification formatting (structured alerts, Markdown stripping, room grouping, tool-approval summaries, internal/redaction filtering, and iOS NSE metadata) alongside high-priority MindRoom incoming-call alerts with deadline-bounded expiry.
 
 ## What it does
 
-- Subclasses Sygnal `v0.17.0`'s `ApnsPushkin` as `mindroom_pushkin.MindroomApnsPushkin`.
+### iOS APNs (`mindroom_pushkin.MindroomApnsPushkin`)
+
+- Subclasses Sygnal `v0.17.0`'s `ApnsPushkin`.
 - **Rich iOS notifications** for alert-bearing non-ring events:
+  - Drops `m.room.redaction` and internal `io.mindroom.*` / `com.mindroom.*` events (except pending `io.mindroom.tool_approval`, which formats as `"Approval needed: <tool_name>"` / `"Approval needed"`).
   - Replaces `aps.alert` on `m.room.message` (`m.text` and `m.notice`) with structured `title`, optional `subtitle` (when the room name differs from the sender), and Markdown-stripped `body` (dropping any `default_payload.aps.alert` keys), falling back to stock `MSG_FROM_USER` / `MSG_FROM_USER_IN_ROOM` if the cleaned body is empty.
-  - Strips Markdown (including Matrix rich-reply fallbacks and MindRoom tool-call marker lines) from text, notice, and `m.emote` bodies while preserving code blocks and identifiers, and marks every payload whose preview it stripped with top-level `mindroom_plain: 1` so the iOS extension does not strip it a second time.
-  - Sets `aps.mutable-content = 1`, `aps.thread-id` from `room_id`, and UTF-8-bounded top-level `sender`, `sender_display_name`, and `room_name` metadata for the iOS `UNNotificationServiceExtension`.
-  - Treats those fields, `mindroom_ring`, `mindroom_plain`, and the `aps.alert` body/title/subtitle keys as gateway-owned: values supplied through the pusher's `default_payload` are removed from every event-generated alert, as is a `default_payload.room_id` when the homeserver sent no `room_id`.
-  - Stays within the APNs 4096-byte limit without erasing the preview: if Sygnal's truncation could not keep at least 64 bytes of each preview string, the payload drops `sender_display_name`, `room_name`, and `subtitle`; if that is still too large, it sends the stock payload minus the gateway-owned fields.
-- **Incoming call rings** (recognized only when all three hold):
-  1. The homeserver set the `sound: "ring"` tweak.
-  2. The wire type matches either `org.matrix.msc4075.rtc.notification` (top-level ring fields) or `m.room.encrypted` (cleartext `io.mindroom.rtc.notification` hint).
-  3. `notification_type == "ring"` with valid integer `sender_ts > 0`, `lifetime > 0`, and `sender_ts <= now + 20_000`.
-  - Rewrites `aps.alert` to `VOICE_CALL_FROM_USER` / `VIDEO_CALL_FROM_USER` with `[sender_display_name]`, sets `aps.sound = "ring.wav"`, enforces APNs high priority (`10`), caps lifetime at 120 s, adds `mindroom_ring.expires_at`, sets `time_to_live` from remaining ring lifetime, and drops expired rings at payload build time and before every APNs attempt (including retries).
+  - Strips Markdown (including Matrix rich-reply fallbacks and MindRoom tool-call marker lines) from text, notice, and `m.emote` bodies while preserving code blocks and identifiers, and marks stripped previews with top-level `mindroom_plain: 1` so the iOS extension does not strip them twice.
+  - Sets `aps.mutable-content = 1`, `aps.thread-id` from `room_id`, and UTF-8-bounded top-level `sender`, `sender_display_name`, and `room_name` metadata for the iOS `UNNotificationServiceExtension`, while stripping pusher-supplied gateway-owned fields from `default_payload`.
+  - Stays within the APNs 4096-byte limit without erasing the preview (dropping optional metadata, then falling back to the sanitized stock payload if needed).
+- **Incoming call rings** (recognized only when `tweaks.sound == "ring"`, wire type is `org.matrix.msc4075.rtc.notification` or `m.room.encrypted` with cleartext `io.mindroom.rtc.notification`, and `notification_type == "ring"` with valid `sender_ts > 0`, `lifetime > 0`, and `sender_ts <= now + 20_000`):
+  - Rewrites `aps.alert` to `VOICE_CALL_FROM_USER` / `VIDEO_CALL_FROM_USER`, sets `aps.sound = "ring.wav"`, enforces APNs high priority (`10`), caps lifetime at 120 s, adds `mindroom_ring.expires_at`, recomputes `time_to_live` before every send, and drops expired rings at build time and before every retry.
 - Leaves badge-only notifications and `event_id_only` payloads identical to stock `ApnsPushkin`.
+
+### Android FCM HTTP v1 (`mindroom_pushkin.MindroomFcmPushkin`)
+
+- Subclasses Sygnal `v0.17.0`'s `GcmPushkin` (requires `api_version: v1`; `SafeFcmPushkin` falls back to stock `GcmPushkin` on setup failure).
+- **Rich visible Android notifications** for alert-bearing events (non-internal, non-redaction, non-badge-only, non-join membership):
+  - Populates FCM HTTP v1 `message.notification = {title, body}` using the shared Markdown-stripping and tool-approval helpers (room + sender title for group rooms, sender for DMs, `"New message"` fallback for `event_id_only` and encrypted/bodyless alerts).
+  - Sets `message.android.priority` (`normal` for `prio == "low"`, else `high`) and `message.android.notification` (`channel_id: "mindroom_messages"`, `sound: "default"`, and UTF-8-bounded `tag` from `room_id`).
+- **Incoming call rings** (same 3-part recognition and clock-skew/120 s lifetime rules as APNs):
+  - Sets `message.notification` to caller/room title + `"Incoming voice call"` / `"Incoming video call"`, `message.android` with `priority: "high"`, `ttl: "<remaining_secs>s"`, `channel_id: "mindroom_calls"`, `sound: "default"`, optional `tag`, and stringified `message.data.mindroom_ring` (`{"expires_at":...,"call_type":"voice"|"video"}`).
+  - Drops expired rings at build time and before every FCM attempt (including retries), recomputing `android.ttl` on each attempt.
+- **Data hygiene & size limits**:
+  - Keeps `message.data` strictly string-valued with routing fields (`room_id`, `event_id`, validated bounded `mindroom_account`, `mindroom_plain: "1"`, `mindroom_ring`), strips untrusted gateway-owned and FCM-forbidden keys from `default_payload`, leaves badge-only notifications data-only (or discards them when empty), and trims/drops optional metadata to stay within the 4096-byte `MAX_FIREBASE_MESSAGE_SIZE` wire limit.
 
 ## Configuration & fallback
 
-Mount the directory containing `mindroom_pushkin.py` and `mindroom_pushkin_loader.py` into the Sygnal `v0.17.0` container (e.g. `/sygnal:ro`), set `PYTHONPATH=/sygnal`, and configure the APNs app with the safe loader:
+Mount the directory containing `mindroom_pushkin.py` and `mindroom_pushkin_loader.py` into the Sygnal `v0.17.0` container (e.g. `/sygnal:ro`), set `PYTHONPATH=/sygnal`, and configure the apps with the safe loaders:
 
 ```yaml
 apps:
   chat.mindroom.app:
     type: mindroom_pushkin_loader.SafeApnsPushkin
+    # ...standard Sygnal APNs keys (keyfile, key_id, team_id, topic, platform)...
+
+  chat.mindroom.app.android:
+    type: mindroom_pushkin_loader.SafeFcmPushkin
+    api_version: v1
+    project_id: your-firebase-project-id
+    service_account_file: /run/secrets/fcm-service-account.json
 ```
 
-`SafeApnsPushkin.create` imports and constructs `MindroomApnsPushkin`; if importing or constructing it fails for any reason, it logs the traceback and falls back to stock `sygnal.apnspushkin.ApnsPushkin` so ordinary iOS push notifications keep working.
+`SafeApnsPushkin.create` and `SafeFcmPushkin.create` import and construct `MindroomApnsPushkin` / `MindroomFcmPushkin`; if importing or constructing them fails for any reason (including non-`v1` FCM config), they log the traceback and fall back to stock `ApnsPushkin` / `GcmPushkin` so ordinary push notifications keep working.
 
 ## Nix flake
 
