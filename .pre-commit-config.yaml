@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-docstring-first
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.17.6"
+    hooks:
+      - id: ruff-check
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: tach-check
+        name: Enforce narrow Tach boundaries
+        entry: bash -c 'env -u VIRTUAL_ENV uvx tach check'
+        language: system
+        pass_filenames: false
+
+      - id: privata
+        name: Enforce module privacy
+        entry: bash -c 'env -u VIRTUAL_ENV uvx privata --methods .'
+        language: system
+        pass_filenames: false

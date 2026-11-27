@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2026 MindRoom contributors
 #
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -21,9 +20,13 @@ import copy
 import importlib
 import json
 import unittest
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
+from sygnal.exceptions import PushkinSetupException
+from sygnal.gcmpushkin import MAX_FIREBASE_MESSAGE_SIZE, GcmPushkin
+from sygnal.notifications import Notification, NotificationContext
+from sygnal.sygnal import CONFIG_DEFAULTS, Sygnal, merge_left_with_defaults
 from twisted.internet.defer import ensureDeferred
 from twisted.internet.testing import MemoryReactorClock
 from twisted.python.failure import Failure
@@ -33,36 +36,35 @@ from twisted.web.http_headers import Headers
 import mindroom_fcm_pushkin
 import mindroom_pushkin
 from mindroom_fcm_pushkin import (
-    FCM_ACCOUNT_KEY,
-    FCM_CALL_CHANNEL_ID,
-    FCM_MESSAGE_CHANNEL_ID,
-    FCM_SILENT_MESSAGE_CHANNEL_ID,
-    MAX_ACCOUNT_BYTES,
+    _FCM_ACCOUNT_KEY,
+    _FCM_CALL_CHANNEL_ID,
+    _FCM_MESSAGE_CHANNEL_ID,
+    _FCM_SILENT_MESSAGE_CHANNEL_ID,
+    _MAX_ACCOUNT_BYTES,
     MindroomFcmPushkin,
 )
 from mindroom_pushkin import (
-    ENCRYPTED_EVENT_TYPE,
-    MAX_CLOCK_SKEW_MS,
-    MAX_RING_LIFETIME_MS,
+    _ENCRYPTED_EVENT_TYPE,
+    _MAX_CLOCK_SKEW_MS,
+    _MAX_RING_LIFETIME_MS,
+    _REDACTION_EVENT_TYPE,
+    _RING_HINT_KEY,
+    _RTC_NOTIFICATION_TYPE,
     MAX_THREAD_ID_BYTES,
     MIN_PREVIEW_BYTES,
     PLAIN_PAYLOAD_KEY,
-    REDACTION_EVENT_TYPE,
-    RING_HINT_KEY,
     RING_PAYLOAD_KEY,
-    RTC_NOTIFICATION_TYPE,
     TOOL_APPROVAL_TYPE,
 )
-from sygnal.exceptions import PushkinSetupException
-from sygnal.gcmpushkin import MAX_FIREBASE_MESSAGE_SIZE, GcmPushkin
-from sygnal.notifications import Notification, NotificationContext
-from sygnal.sygnal import CONFIG_DEFAULTS, Sygnal, merge_left_with_defaults
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 FCM_APP_ID = "com.mindroom_ai.app"
 FCM_PROJECT_ID = "mindroom-test-project"
 BASE_NOW_MS = 1_795_300_000_000
 
-FCM_SPOOFED_DEFAULT_PAYLOAD: Dict[str, Any] = {
+FCM_SPOOFED_DEFAULT_PAYLOAD: dict[str, Any] = {
     "sender": "@spoof:evil.example",
     "sender_display_name": "Spoofed Admin",
     "room_name": "Spoofed Room",
@@ -81,20 +83,20 @@ FCM_SPOOFED_DEFAULT_PAYLOAD: Dict[str, Any] = {
     "bad_int": 42,
     "bad_dict": {"nested": "x"},
     "bad_none": None,
-    FCM_ACCOUNT_KEY: "@me:mindroom.chat",
+    _FCM_ACCOUNT_KEY: "@me:mindroom.chat",
     "custom": "kept",
 }
 
 
-def _ring(sender_ts: int, lifetime: int = 30_000, intent: Optional[str] = "audio") -> Dict[str, Any]:
-    fields: Dict[str, Any] = {"notification_type": "ring", "sender_ts": sender_ts, "lifetime": lifetime}
+def _ring(sender_ts: int, lifetime: int = 30_000, intent: str | None = "audio") -> dict[str, Any]:
+    fields: dict[str, Any] = {"notification_type": "ring", "sender_ts": sender_ts, "lifetime": lifetime}
     if intent is not None:
         fields["m.call.intent"] = intent
     return fields
 
 
-def _enc(hint: Any) -> Dict[str, Any]:
-    return {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque", RING_HINT_KEY: hint}
+def _enc(hint: Any) -> dict[str, Any]:
+    return {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque", _RING_HINT_KEY: hint}
 
 
 _DEFAULT_TWEAKS: Any = object()
@@ -102,37 +104,42 @@ _DEFAULT_TWEAKS: Any = object()
 
 def _raw(
     *,
-    event_type: Optional[str] = RTC_NOTIFICATION_TYPE,
-    content: Optional[Dict[str, Any]] = None,
-    sender: Optional[str] = "@alice:example.com",
-    sender_display_name: Optional[str] = "Alice",
-    room_name: Optional[str] = None,
-    room_id: Optional[str] = "!room:example.com",
-    user_is_target: Optional[bool] = None,
-    membership: Optional[str] = None,
+    event_type: str | None = _RTC_NOTIFICATION_TYPE,
+    content: dict[str, Any] | None = None,
+    sender: str | None = "@alice:example.com",
+    sender_display_name: str | None = "Alice",
+    room_name: str | None = None,
+    room_id: str | None = "!room:example.com",
+    user_is_target: bool | None = None,
+    membership: str | None = None,
     prio: str = "high",
     tweaks: Any = _DEFAULT_TWEAKS,
-    default_payload: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    dev: Dict[str, Any] = {"app_id": FCM_APP_ID, "pushkey": "fcm-device-token-123"}
+    default_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    dev: dict[str, Any] = {"app_id": FCM_APP_ID, "pushkey": "fcm-device-token-123"}
     if tweaks is _DEFAULT_TWEAKS:
         dev["tweaks"] = {"sound": "default"}
     elif tweaks is not None:
         dev["tweaks"] = tweaks
     if default_payload is not None:
         dev["data"] = {"default_payload": default_payload}
-    raw: Dict[str, Any] = {"event_id": "$event1", "prio": prio, "counts": {"unread": 1}, "devices": [dev]}
+    raw: dict[str, Any] = {"event_id": "$event1", "prio": prio, "counts": {"unread": 1}, "devices": [dev]}
     for key, val in (
-        ("room_id", room_id), ("type", event_type), ("content", content), ("sender", sender),
-        ("sender_display_name", sender_display_name), ("room_name", room_name),
-        ("user_is_target", user_is_target), ("membership", membership),
+        ("room_id", room_id),
+        ("type", event_type),
+        ("content", content),
+        ("sender", sender),
+        ("sender_display_name", sender_display_name),
+        ("room_name", room_name),
+        ("user_is_target", user_is_target),
+        ("membership", membership),
     ):
         if val is not None:
             raw[key] = val
     return raw
 
 
-def _msg(body: str, msgtype: str = "m.text", **kwargs: Any) -> Dict[str, Any]:
+def _msg(body: str, msgtype: str = "m.text", **kwargs: Any) -> dict[str, Any]:
     return _raw(event_type="m.room.message", content={"msgtype": msgtype, "body": body}, **kwargs)
 
 
@@ -141,7 +148,7 @@ class _FakeHttpResponse:
         self,
         code: int = 200,
         body: bytes = b'{"name":"projects/p/messages/1"}',
-        headers: Optional[Dict[bytes, List[bytes]]] = None,
+        headers: dict[bytes, list[bytes]] | None = None,
     ) -> None:
         self.code, self.phrase, self.length, self._body = code, b"OK", len(body), body
         self.headers = Headers(headers or {})
@@ -155,8 +162,8 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.now_ms = BASE_NOW_MS
         self.reactor = MemoryReactorClock()
-        self.sent_requests: List[Tuple[bytes, bytes, Headers, bytes, Dict[str, Any]]] = []
-        self.response_handler: Callable[[Dict[str, Any]], _FakeHttpResponse] = lambda _: _FakeHttpResponse()
+        self.sent_requests: list[tuple[bytes, bytes, Headers, bytes, dict[str, Any]]] = []
+        self.response_handler: Callable[[dict[str, Any]], _FakeHttpResponse] = lambda _: _FakeHttpResponse()
         self.creds = MagicMock(valid=True, token="fake-bearer-token")
 
         async def _fake_request(
@@ -172,7 +179,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         patch.object(mindroom_pushkin, "now_ms", side_effect=lambda: self.now_ms).start()
         self.addCleanup(patch.stopall)
 
-        self.fcm_app_cfg: Dict[str, Any] = {
+        self.fcm_app_cfg: dict[str, Any] = {
             "type": "mindroom_fcm_pushkin.MindroomFcmPushkin",
             "api_version": "v1",
             "project_id": FCM_PROJECT_ID,
@@ -190,7 +197,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.pushkin = await self._await(self.sygnal._make_pushkin(FCM_APP_ID, cfg["apps"][FCM_APP_ID]))
         self.assertIsInstance(self.pushkin, MindroomFcmPushkin)
 
-    async def _await(self, coro: Any, *, advance: Optional[List[int]] = None) -> Any:
+    async def _await(self, coro: Any, *, advance: list[int] | None = None) -> Any:
         fut = ensureDeferred(coro).asFuture(asyncio.get_running_loop())
         for secs in advance or []:
             await asyncio.sleep(0)
@@ -202,15 +209,15 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         return await fut
 
     async def _dispatch(
-        self, raw: Dict[str, Any], *, pushkin: Optional[GcmPushkin] = None, advance: Optional[List[int]] = None
-    ) -> List[str]:
+        self, raw: dict[str, Any], *, pushkin: GcmPushkin | None = None, advance: list[int] | None = None
+    ) -> list[str]:
         notif = Notification(copy.deepcopy(raw))
         ctx = NotificationContext("req-fcm", self.sygnal.tracer.start_span("test"), 0.0)
         return await self._await(
             (pushkin or self.pushkin).dispatch_notification(notif, notif.devices[0], ctx), advance=advance
         )
 
-    async def _send_one(self, raw: Dict[str, Any], *, pushkin: Optional[GcmPushkin] = None) -> Dict[str, Any]:
+    async def _send_one(self, raw: dict[str, Any], *, pushkin: GcmPushkin | None = None) -> dict[str, Any]:
         self.sent_requests.clear()
         self.assertEqual(await self._dispatch(raw, pushkin=pushkin), [])
         self.assertEqual(len(self.sent_requests), 1)
@@ -227,11 +234,14 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_fcm_rich_alert_wire_payloads(self) -> None:
         event_id_only = {
-            "room_id": "!room:example.com", "event_id": "$e1", "prio": "low", "counts": {"unread": 1},
+            "room_id": "!room:example.com",
+            "event_id": "$e1",
+            "prio": "low",
+            "counts": {"unread": 1},
             "devices": [{"app_id": FCM_APP_ID, "pushkey": "fcm-device-token-123", "tweaks": {"sound": "default"}}],
         }
         md = "> <@b:e> old\n\n🔧 `sh` [1]\n**Deploy** [docs](https://mindroom.chat)"
-        cases: List[Tuple[str, Dict[str, Any], str, str, bool, str]] = [
+        cases: list[tuple[str, dict[str, Any], str, str, bool, str]] = [
             ("group_md", _msg(md, room_name="Engineering"), "Engineering: Alice", "Deploy docs", True, "high"),
             ("dm", _msg("*Hi*!"), "Alice", "Hi!", True, "high"),
             ("dm_same_room", _msg("**Ready**", "m.notice", room_name="Alice"), "Alice", "Ready", True, "high"),
@@ -241,34 +251,52 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             (
                 "approval_named",
                 _raw(
-                    event_type=TOOL_APPROVAL_TYPE, room_name="Ops", sender_display_name="DevAgent",
+                    event_type=TOOL_APPROVAL_TYPE,
+                    room_name="Ops",
+                    sender_display_name="DevAgent",
                     content={"status": "pending", "tool_name": "bash"},
                 ),
-                "Ops: DevAgent", "Approval needed: bash", True, "high",
+                "Ops: DevAgent",
+                "Approval needed: bash",
+                True,
+                "high",
             ),
             (
                 "approval_unnamed",
                 _raw(event_type=TOOL_APPROVAL_TYPE, sender_display_name="DevAgent", content={"status": "pending"}),
-                "DevAgent", "Approval needed", True, "high",
+                "DevAgent",
+                "Approval needed",
+                True,
+                "high",
             ),
             (
                 "encrypted",
                 _raw(
-                    event_type=ENCRYPTED_EVENT_TYPE, room_name="Secret",
+                    event_type=_ENCRYPTED_EVENT_TYPE,
+                    room_name="Secret",
                     content={"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque"},
                 ),
-                "Secret: Alice", "New message", False, "high",
+                "Secret: Alice",
+                "New message",
+                False,
+                "high",
             ),
             ("event_id_only_low", event_id_only, "MindRoom", "New message", False, "normal"),
             (
                 "invite",
                 _raw(event_type="m.room.member", room_name="Design", user_is_target=True, membership="invite"),
-                "Design: Alice", "Invited you to Design", False, "high",
+                "Design: Alice",
+                "Invited you to Design",
+                False,
+                "high",
             ),
             (
                 "legacy_video_call",
                 _raw(event_type="m.call.invite", content={"offer": {"sdp": "v=0\r\nm=video 9\r\n"}}),
-                "Alice", "Incoming video call", False, "high",
+                "Alice",
+                "Incoming video call",
+                False,
+                "high",
             ),
         ]
         for label, raw, want_title, want_body, want_plain, want_prio in cases:
@@ -279,7 +307,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(msg["android"]["restricted_package_name"], FCM_APP_ID)
                 self.assertEqual(
                     msg["android"]["notification"],
-                    {"channel_id": FCM_MESSAGE_CHANNEL_ID, "sound": "default", "tag": "!room:example.com"},
+                    {"channel_id": _FCM_MESSAGE_CHANNEL_ID, "sound": "default", "tag": "!room:example.com"},
                 )
                 self.assertEqual(msg["data"]["room_id"], "!room:example.com")
                 self.assertEqual(msg["data"].get(PLAIN_PAYLOAD_KEY), "1" if want_plain else None)
@@ -293,13 +321,16 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
         # Silent push rules (no sound tweak / empty / whitespace) use silent channel with no sound.
         for label, silent_tweaks in (
-            ("omitted", None), ("empty_dict", {}), ("empty_str", {"sound": ""}), ("spaces", {"sound": "   "})
+            ("omitted", None),
+            ("empty_dict", {}),
+            ("empty_str", {"sound": ""}),
+            ("spaces", {"sound": "   "}),
         ):
             with self.subTest(silent=label):
                 silent = await self._send_one(_msg("Quiet update", tweaks=silent_tweaks))
                 self.assertEqual(
                     silent["android"]["notification"],
-                    {"channel_id": FCM_SILENT_MESSAGE_CHANNEL_ID, "tag": "!room:example.com"},
+                    {"channel_id": _FCM_SILENT_MESSAGE_CHANNEL_ID, "tag": "!room:example.com"},
                 )
 
     async def test_fcm_options_precedence_and_badge_banner_stripping(self) -> None:
@@ -323,7 +354,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 "data": {
                     "room_id": "!from-android:ex",
                     "event_id": "$from-android",
-                    FCM_ACCOUNT_KEY: "@from-android:ex",
+                    _FCM_ACCOUNT_KEY: "@from-android:ex",
                     RING_PAYLOAD_KEY: "from-android",
                     PLAIN_PAYLOAD_KEY: "1",
                     "env": "prod",
@@ -338,7 +369,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
         # Alert push: android.data removed, safe config strings merged under gateway fields.
         alert = await self._send_one(
-            _msg("**Hello**", default_payload={FCM_ACCOUNT_KEY: "@me:mindroom.chat"}), pushkin=pushkin
+            _msg("**Hello**", default_payload={_FCM_ACCOUNT_KEY: "@me:mindroom.chat"}), pushkin=pushkin
         )
         self.assertEqual(alert["notification"], {"title": "Alice", "body": "Hello"})
         self.assertEqual(
@@ -346,7 +377,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             {
                 "icon": "ic_stat",
                 "color": "#112233",
-                "channel_id": FCM_MESSAGE_CHANNEL_ID,
+                "channel_id": _FCM_MESSAGE_CHANNEL_ID,
                 "sound": "default",
                 "tag": "!room:example.com",
             },
@@ -364,7 +395,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             {
                 "icon": "ic_stat",
                 "color": "#112233",
-                "channel_id": FCM_SILENT_MESSAGE_CHANNEL_ID,
+                "channel_id": _FCM_SILENT_MESSAGE_CHANNEL_ID,
                 "tag": "!room:example.com",
             },
         )
@@ -372,7 +403,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("defaultSound", silent_alert["android"]["notification"])
         self.assertEqual(alert["data"]["room_id"], "!room:example.com")
         self.assertEqual(alert["data"]["event_id"], "$event1")
-        self.assertEqual(alert["data"][FCM_ACCOUNT_KEY], "@me:mindroom.chat")
+        self.assertEqual(alert["data"][_FCM_ACCOUNT_KEY], "@me:mindroom.chat")
         self.assertEqual(alert["data"]["env"], "prod")
         self.assertEqual(alert["data"]["top_opt"], "top_val")
         self.assertNotIn("bad_int", alert["data"])
@@ -387,7 +418,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             {
                 "icon": "ic_stat",
                 "color": "#112233",
-                "channel_id": FCM_CALL_CHANNEL_ID,
+                "channel_id": _FCM_CALL_CHANNEL_ID,
                 "sound": "default",
                 "tag": "call:!room:example.com",
             },
@@ -431,7 +462,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             }
         ]
         for label, raw in (
-            ("redaction", _raw(event_type=REDACTION_EVENT_TYPE)),
+            ("redaction", _raw(event_type=_REDACTION_EVENT_TYPE)),
             ("internal_io", _raw(event_type="io.mindroom.internal")),
             ("internal_com", _raw(event_type="com.mindroom.sync")),
             ("tool_approved", _raw(event_type=TOOL_APPROVAL_TYPE, content={"status": "approved", "tool_name": "bash"})),
@@ -449,7 +480,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("notification", badge_msg["android"])
         self.assertEqual(badge_msg["android"]["priority"], "normal")
         self.assertEqual(badge_msg["data"]["unread"], "4")
-        self.assertEqual(badge_msg["data"][FCM_ACCOUNT_KEY], "@me:mindroom.chat")
+        self.assertEqual(badge_msg["data"][_FCM_ACCOUNT_KEY], "@me:mindroom.chat")
         self.assertNotIn("room_id", badge_msg["data"])
 
         no_badge = await self._await(
@@ -477,7 +508,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 "ttl": "30s",
                 "restricted_package_name": FCM_APP_ID,
                 "notification": {
-                    "channel_id": FCM_CALL_CHANNEL_ID,
+                    "channel_id": _FCM_CALL_CHANNEL_ID,
                     "sound": "default",
                     "tag": "call:!room:example.com",
                 },
@@ -503,7 +534,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
         video = await self._send_one(
             _raw(
-                event_type=ENCRYPTED_EVENT_TYPE,
+                event_type=_ENCRYPTED_EVENT_TYPE,
                 sender_display_name=None,
                 room_name="Standup",
                 room_id=None,
@@ -516,24 +547,27 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tag", video["android"]["notification"])
         self.assertEqual(
             json.loads(video["data"][RING_PAYLOAD_KEY]),
-            {"expires_at": self.now_ms + MAX_RING_LIFETIME_MS, "call_type": "video"},
+            {"expires_at": self.now_ms + _MAX_RING_LIFETIME_MS, "call_type": "video"},
         )
 
         anon = await self._send_one(
             _raw(
-                sender=None, sender_display_name=None, room_name=None,
-                content=_ring(self.now_ms), tweaks={"sound": "ring"},
+                sender=None,
+                sender_display_name=None,
+                room_name=None,
+                content=_ring(self.now_ms),
+                tweaks={"sound": "ring"},
             )
         )
         self.assertEqual(anon["notification"]["title"], "MindRoom")
 
         for label, raw, want_chan in (
-            ("no_ring_tweak_audible", _raw(content=_ring(self.now_ms)), FCM_MESSAGE_CHANNEL_ID),
-            ("no_ring_tweak_silent", _raw(content=_ring(self.now_ms), tweaks=None), FCM_SILENT_MESSAGE_CHANNEL_ID),
+            ("no_ring_tweak_audible", _raw(content=_ring(self.now_ms)), _FCM_MESSAGE_CHANNEL_ID),
+            ("no_ring_tweak_silent", _raw(content=_ring(self.now_ms), tweaks=None), _FCM_SILENT_MESSAGE_CHANNEL_ID),
             (
                 "future_skew",
-                _raw(content=_ring(self.now_ms + MAX_CLOCK_SKEW_MS + 1), tweaks={"sound": "ring"}),
-                FCM_MESSAGE_CHANNEL_ID,
+                _raw(content=_ring(self.now_ms + _MAX_CLOCK_SKEW_MS + 1), tweaks={"sound": "ring"}),
+                _FCM_MESSAGE_CHANNEL_ID,
             ),
         ):
             with self.subTest(non_ring=label):
@@ -543,9 +577,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(RING_PAYLOAD_KEY, msg["data"])
 
         self.sent_requests.clear()
-        self.assertEqual(
-            await self._dispatch(_raw(content=_ring(self.now_ms - 30_000), tweaks={"sound": "ring"})), []
-        )
+        self.assertEqual(await self._dispatch(_raw(content=_ring(self.now_ms - 30_000), tweaks={"sound": "ring"})), [])
         self.assertEqual(self.sent_requests, [])
 
         for label, age_ms, status, resp_hdrs, ok_on, adv, want_ttls in (
@@ -560,7 +592,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 attempts = 0
 
                 def _handler(
-                    _: Dict[str, Any], st: int = status, hdrs: Any = resp_hdrs, ok: Optional[int] = ok_on
+                    _: dict[str, Any], st: int = status, hdrs: Any = resp_hdrs, ok: int | None = ok_on
                 ) -> _FakeHttpResponse:
                     nonlocal attempts
                     attempts += 1
@@ -579,32 +611,48 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_fcm_hygiene_surrogates_and_bounded_size_trimming(self) -> None:
         msg = await self._send_one(
             _raw(
-                event_type=ENCRYPTED_EVENT_TYPE,
+                event_type=_ENCRYPTED_EVENT_TYPE,
                 room_id=None,
                 content={"algorithm": "m.megolm.v1.aes-sha2"},
                 default_payload=FCM_SPOOFED_DEFAULT_PAYLOAD,
             )
         )
         for key in (
-            "sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY,
-            "room_id", "notification", "android", "from", "message_type",
-            "google.c.a.e", "gcm.notification.title", "bad_int", "bad_dict", "bad_none",
+            "sender",
+            "sender_display_name",
+            "room_name",
+            RING_PAYLOAD_KEY,
+            PLAIN_PAYLOAD_KEY,
+            "room_id",
+            "notification",
+            "android",
+            "from",
+            "message_type",
+            "google.c.a.e",
+            "gcm.notification.title",
+            "bad_int",
+            "bad_dict",
+            "bad_none",
         ):
             self.assertNotIn(key, msg["data"])
         self.assertEqual(msg["data"]["event_id"], "$event1")
-        self.assertEqual(msg["data"][FCM_ACCOUNT_KEY], "@me:mindroom.chat")
+        self.assertEqual(msg["data"][_FCM_ACCOUNT_KEY], "@me:mindroom.chat")
         self.assertEqual(msg["data"]["custom"], "kept")
 
-        for bad_acct in ("", "   ", 123, None, "a\nb", "a\ud83db", "a" * (MAX_ACCOUNT_BYTES + 1)):
+        for bad_acct in ("", "   ", 123, None, "a\nb", "a\ud83db", "a" * (_MAX_ACCOUNT_BYTES + 1)):
             with self.subTest(bad_account=bad_acct):
-                m = await self._send_one(_msg("hi", default_payload={FCM_ACCOUNT_KEY: bad_acct}))
-                self.assertNotIn(FCM_ACCOUNT_KEY, m["data"])
+                m = await self._send_one(_msg("hi", default_payload={_FCM_ACCOUNT_KEY: bad_acct}))
+                self.assertNotIn(_FCM_ACCOUNT_KEY, m["data"])
 
         bad = "\ud83d"
         surrogate_msg = await self._send_one(
             _msg(
-                f"He{bad}llo", sender=f"@al{bad}ice:ex", sender_display_name=f"Al{bad}ice",
-                room_name=f"Eng{bad}", room_id=f"!r{bad}:ex", default_payload={"custom": f"val{bad}"},
+                f"He{bad}llo",
+                sender=f"@al{bad}ice:ex",
+                sender_display_name=f"Al{bad}ice",
+                room_name=f"Eng{bad}",
+                room_id=f"!r{bad}:ex",
+                default_payload={"custom": f"val{bad}"},
             )
         )
         json.dumps(surrogate_msg, ensure_ascii=False).encode("utf-8")
@@ -612,19 +660,17 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
         # Many custom keys are dropped in ONE single batch (O(1) serializations, never quadratic).
         many_custom = {f"k{i}": "v" * 20 for i in range(400)}
-        many_custom[FCM_ACCOUNT_KEY] = "@me:mindroom.chat"
+        many_custom[_FCM_ACCOUNT_KEY] = "@me:mindroom.chat"
         with patch.object(
             mindroom_fcm_pushkin, "_fcm_wire_size", wraps=mindroom_fcm_pushkin._fcm_wire_size
         ) as size_spy:
             trimmed = await self._send_one(_msg("Short preview", default_payload=many_custom))
         self.assertLessEqual(size_spy.call_count, 3)
         self.assertEqual(trimmed["notification"]["body"], "Short preview")
-        self.assertEqual(trimmed["data"][FCM_ACCOUNT_KEY], "@me:mindroom.chat")
+        self.assertEqual(trimmed["data"][_FCM_ACCOUNT_KEY], "@me:mindroom.chat")
         self.assertNotIn("k0", trimmed["data"])
 
-        huge_emoji = await self._send_one(
-            _msg("🔥" * 500, default_payload={FCM_ACCOUNT_KEY: "@me:mindroom.chat"})
-        )
+        huge_emoji = await self._send_one(_msg("🔥" * 500, default_payload={_FCM_ACCOUNT_KEY: "@me:mindroom.chat"}))
         self.assertTrue(huge_emoji["notification"]["body"].endswith("…"))
         self.assertGreaterEqual(len(huge_emoji["notification"]["body"].encode("utf-8")), MIN_PREVIEW_BYTES)
 
@@ -652,6 +698,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
         real_import = importlib.import_module
         for exc in (ImportError("broken"), SyntaxError("bad")):
+
             def _fail(name: str, *a: Any, e: Exception = exc, **kw: Any) -> Any:
                 if name == "mindroom_fcm_pushkin":
                     raise e
