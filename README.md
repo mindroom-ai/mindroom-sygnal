@@ -53,6 +53,43 @@ apps:
 
 `packages.<system>.default` builds a store directory containing `mindroom_pushkin.py`, `mindroom_fcm_pushkin.py`, and `mindroom_pushkin_loader.py` (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`).
 
+## NixOS module
+
+The flake exports `nixosModules.default` (alias `nixosModules.mindroom-sygnal`), which runs the pinned Sygnal `v0.17.0` container via Podman, bind-mounts `packages.<system>.default` read-only at `/sygnal-addons` with `PYTHONPATH=/sygnal-addons`, stages runtime secrets and `sygnal.yaml` under `/run/sygnal` (`0400`), and skips startup cleanly until placeholder secrets (`CHANGE_ME`) are replaced.
+
+The module is secret-manager agnostic: pass runtime file paths (e.g. from agenix or sops-nix) and optionally wire ciphertext files into `extraRestartTriggers`:
+
+```nix
+{ config, mindroom-sygnal, ... }:
+
+{
+  imports = [ mindroom-sygnal.nixosModules.default ];
+
+  services.mindroom-sygnal = {
+    enable = true;
+    extraRestartTriggers = [
+      config.age.secrets.sygnal-env.file
+      config.age.secrets.sygnal-apns-key.file
+      config.age.secrets.sygnal-fcm-service-account.file
+    ];
+    apns = {
+      enable = true;
+      appId = "chat.mindroom.app";
+      keyFile = config.age.secrets.sygnal-apns-key.path;
+      envFile = config.age.secrets.sygnal-env.path;
+    };
+    fcm = {
+      enable = true;
+      appId = "com.mindroom_ai.app";
+      projectId = "your-firebase-project-id";
+      serviceAccountFile = config.age.secrets.sygnal-fcm-service-account.path;
+    };
+  };
+}
+```
+
+Enable `apns`, `fcm`, or both. When `apns.envFile` is omitted (`null`), `sygnal.yaml` is installed directly without running `envsubst` and `apns.keyId`, `apns.teamId`, `apns.topic`, and `apns.platform` must be set to literal values.
+
 ## Testing
 
 Run the test suite inside the pinned Sygnal `v0.17.0` image:
