@@ -47,7 +47,7 @@ apps:
     service_account_file: /run/secrets/fcm-service-account.json
 ```
 
-`SafeApnsPushkin.create` and `SafeFcmPushkin.create` import and construct `MindroomApnsPushkin` / `MindroomFcmPushkin`; if importing or constructing them fails for any reason (including non-`v1` FCM config), they log the traceback and fall back to stock `ApnsPushkin` / `GcmPushkin` so ordinary push notifications keep working.
+`SafeApnsPushkin.create` and `SafeFcmPushkin.create` import and construct `MindroomApnsPushkin` / `MindroomFcmPushkin`; if importing or constructing them fails for any reason (including non-`v1` FCM config), they log the traceback and fall back to stock `ApnsPushkin` / `GcmPushkin` so pushkin initialization still succeeds (note that Google retired the legacy FCM endpoint, so `api_version: v1` is still required for live FCM delivery).
 
 ## Nix flake
 

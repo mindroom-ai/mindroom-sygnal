@@ -352,8 +352,13 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        # Silent alert strips fcm_options android.notification.sound and title/body overrides too.
-        silent_alert = await self._send_one(_msg("Quiet", tweaks=None), pushkin=pushkin)
+        # Silent alert strips fcm_options sound, default_sound, defaultSound, and title/body overrides.
+        silent_opts = copy.deepcopy(rich_opts)
+        silent_opts["android"]["notification"].update(default_sound=True, defaultSound=True)
+        silent_pushkin = await self._await(
+            self.sygnal._make_pushkin(FCM_APP_ID, {**self.fcm_app_cfg, "fcm_options": silent_opts})
+        )
+        silent_alert = await self._send_one(_msg("Quiet", tweaks=None), pushkin=silent_pushkin)
         self.assertEqual(
             silent_alert["android"]["notification"],
             {
@@ -363,6 +368,8 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 "tag": "!room:example.com",
             },
         )
+        self.assertNotIn("default_sound", silent_alert["android"]["notification"])
+        self.assertNotIn("defaultSound", silent_alert["android"]["notification"])
         self.assertEqual(alert["data"]["room_id"], "!room:example.com")
         self.assertEqual(alert["data"]["event_id"], "$event1")
         self.assertEqual(alert["data"][FCM_ACCOUNT_KEY], "@me:mindroom.chat")

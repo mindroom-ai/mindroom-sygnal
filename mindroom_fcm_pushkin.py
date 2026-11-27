@@ -372,6 +372,8 @@ class MindroomFcmPushkin(GcmPushkin):
                 an["sound"] = "default"
             else:
                 an.pop("sound", None)
+                an.pop("default_sound", None)
+                an.pop("defaultSound", None)
             if room_id is not None:
                 tag_src = f"call:{room_id}" if ring is not None else room_id
                 an["tag"] = _truncate_utf8(tag_src, MAX_THREAD_ID_BYTES)
