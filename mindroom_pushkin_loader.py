@@ -31,10 +31,15 @@ _PushkinT = TypeVar("_PushkinT", ApnsPushkin, GcmPushkin)
 
 
 async def _load_pushkin(
-    attr: str, base_cls: Type[_PushkinT], name: str, sygnal: "Sygnal", config: Dict[str, Any]
+    module_name: str,
+    attr: str,
+    base_cls: Type[_PushkinT],
+    name: str,
+    sygnal: "Sygnal",
+    config: Dict[str, Any],
 ) -> _PushkinT:
     try:
-        mod = importlib.import_module("mindroom_pushkin")
+        mod = importlib.import_module(module_name)
         pushkin = await getattr(mod, attr).create(name, sygnal, config)
         if not isinstance(pushkin, base_cls):
             raise TypeError(f"Expected {base_cls.__name__}, got {type(pushkin)!r}")
@@ -56,7 +61,9 @@ class SafeApnsPushkin:
     async def create(
         cls, name: str, sygnal: "Sygnal", config: Dict[str, Any]
     ) -> ApnsPushkin:
-        return await _load_pushkin("MindroomApnsPushkin", ApnsPushkin, name, sygnal, config)
+        return await _load_pushkin(
+            "mindroom_pushkin", "MindroomApnsPushkin", ApnsPushkin, name, sygnal, config
+        )
 
 
 class SafeFcmPushkin:
@@ -66,4 +73,6 @@ class SafeFcmPushkin:
     async def create(
         cls, name: str, sygnal: "Sygnal", config: Dict[str, Any]
     ) -> GcmPushkin:
-        return await _load_pushkin("MindroomFcmPushkin", GcmPushkin, name, sygnal, config)
+        return await _load_pushkin(
+            "mindroom_fcm_pushkin", "MindroomFcmPushkin", GcmPushkin, name, sygnal, config
+        )

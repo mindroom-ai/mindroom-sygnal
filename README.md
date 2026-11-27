@@ -17,21 +17,22 @@ APNs and FCM HTTP v1 pushkin add-ons for [Sygnal](https://github.com/element-hq/
   - Rewrites `aps.alert` to `VOICE_CALL_FROM_USER` / `VIDEO_CALL_FROM_USER`, sets `aps.sound = "ring.wav"`, enforces APNs high priority (`10`), caps lifetime at 120 s, adds `mindroom_ring.expires_at`, recomputes `time_to_live` before every send, and drops expired rings at build time and before every retry.
 - Leaves badge-only notifications and `event_id_only` payloads identical to stock `ApnsPushkin`.
 
-### Android FCM HTTP v1 (`mindroom_pushkin.MindroomFcmPushkin`)
+### Android FCM HTTP v1 (`mindroom_fcm_pushkin.MindroomFcmPushkin`)
 
 - Subclasses Sygnal `v0.17.0`'s `GcmPushkin` (requires `api_version: v1`; `SafeFcmPushkin` falls back to stock `GcmPushkin` on setup failure).
 - **Rich visible Android notifications** for alert-bearing events (non-internal, non-redaction, non-badge-only, non-join membership):
   - Populates FCM HTTP v1 `message.notification = {title, body}` using the shared Markdown-stripping and tool-approval helpers (room + sender title for group rooms, sender for DMs, `"New message"` fallback for `event_id_only` and encrypted/bodyless alerts).
   - Sets `message.android.priority` (`normal` for `prio == "low"`, else `high`) and `message.android.notification` (`channel_id: "mindroom_messages"`, `sound: "default"`, and UTF-8-bounded `tag` from `room_id`).
 - **Incoming call rings** (same 3-part recognition and clock-skew/120 s lifetime rules as APNs):
-  - Sets `message.notification` to caller/room title + `"Incoming voice call"` / `"Incoming video call"`, `message.android` with `priority: "high"`, `ttl: "<remaining_secs>s"`, `channel_id: "mindroom_calls"`, `sound: "default"`, optional `tag`, and stringified `message.data.mindroom_ring` (`{"expires_at":...,"call_type":"voice"|"video"}`).
+  - Sent as visible high-priority Android notifications (so the OS displays the alert when the app is backgrounded/killed, and `message.data.mindroom_ring` is consumed by the app on notification tap or when in the foreground).
+  - Sets `message.notification` to caller/room title + `"Incoming voice call"` / `"Incoming video call"`, `message.android` with `priority: "high"`, `ttl: "<remaining_secs>s"` (rounded up to at least `1s`), `channel_id: "mindroom_calls"`, `sound: "default"`, optional `tag`, and stringified `message.data.mindroom_ring` (`{"expires_at":...,"call_type":"voice"|"video"}`).
   - Drops expired rings at build time and before every FCM attempt (including retries), recomputing `android.ttl` on each attempt.
 - **Data hygiene & size limits**:
-  - Keeps `message.data` strictly string-valued with routing fields (`room_id`, `event_id`, validated bounded `mindroom_account`, `mindroom_plain: "1"`, `mindroom_ring`), strips untrusted gateway-owned and FCM-forbidden keys from `default_payload`, leaves badge-only notifications data-only (or discards them when empty), and trims/drops optional metadata to stay within the 4096-byte `MAX_FIREBASE_MESSAGE_SIZE` wire limit.
+  - Keeps `message.data` strictly string-valued with routing fields (`room_id`, `event_id`, validated bounded `mindroom_account`, `mindroom_plain: "1"`, `mindroom_ring`), removes `fcm_options.android.data` (merging safe string entries underneath gateway-built `message.data`), strips untrusted gateway-owned and FCM-forbidden keys from `default_payload`, strips any `fcm_options` notification banners on data-only / badge-only pushes, and trims/drops optional metadata in bounded O(1) passes to stay within the 4096-byte `MAX_FIREBASE_MESSAGE_SIZE` wire limit (dropping unfixably oversized payloads rather than sending guaranteed-400 requests).
 
 ## Configuration & fallback
 
-Mount the directory containing `mindroom_pushkin.py` and `mindroom_pushkin_loader.py` into the Sygnal `v0.17.0` container (e.g. `/sygnal:ro`), set `PYTHONPATH=/sygnal`, and configure the apps with the safe loaders:
+Mount the directory containing `mindroom_pushkin.py`, `mindroom_fcm_pushkin.py`, and `mindroom_pushkin_loader.py` into the Sygnal `v0.17.0` container (e.g. `/sygnal:ro`), set `PYTHONPATH=/sygnal`, and configure the apps with the safe loaders:
 
 ```yaml
 apps:
@@ -39,7 +40,7 @@ apps:
     type: mindroom_pushkin_loader.SafeApnsPushkin
     # ...standard Sygnal APNs keys (keyfile, key_id, team_id, topic, platform)...
 
-  chat.mindroom.app.android:
+  com.mindroom_ai.app:
     type: mindroom_pushkin_loader.SafeFcmPushkin
     api_version: v1
     project_id: your-firebase-project-id
@@ -50,7 +51,7 @@ apps:
 
 ## Nix flake
 
-`packages.<system>.default` builds a store directory containing `mindroom_pushkin.py` and `mindroom_pushkin_loader.py` (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`).
+`packages.<system>.default` builds a store directory containing `mindroom_pushkin.py`, `mindroom_fcm_pushkin.py`, and `mindroom_pushkin_loader.py` (`x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`).
 
 ## Testing
 
