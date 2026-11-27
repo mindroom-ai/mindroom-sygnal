@@ -88,7 +88,7 @@ The module is secret-manager agnostic: pass runtime file paths (e.g. from agenix
 }
 ```
 
-Enable `apns`, `fcm`, or both. When `apns.envFile` is omitted (`null`), `sygnal.yaml` is installed directly without running `envsubst` and `apns.keyId`, `apns.teamId`, `apns.topic`, and `apns.platform` must be set to literal values.
+Enable `apns`, `fcm`, or both. When `apns.envFile` is omitted (`null`), `sygnal.yaml` is installed directly without running `envsubst` and `apns.keyId`, `apns.teamId`, `apns.topic`, and `apns.platform` must be set to literal values. After rotating secret files manually out of band, run `systemctl restart sygnal-setup.service podman-sygnal.service` to restage them.
 
 ## Testing
 

@@ -169,6 +169,10 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
+        assertion = config.virtualisation.oci-containers.backend == "podman";
+        message = ''services.mindroom-sygnal requires virtualisation.oci-containers.backend = "podman".'';
+      }
+      {
         assertion = cfg.apns.enable || cfg.fcm.enable;
         message = "services.mindroom-sygnal: at least one of apns.enable or fcm.enable must be true.";
       }
@@ -206,8 +210,6 @@ in
     ];
 
     virtualisation.podman.enable = true;
-    virtualisation.oci-containers.backend = "podman";
-    systemd.tmpfiles.rules = [ "d /run/mindroom-sygnal 0750 root root -" ];
 
     systemd.services.sygnal-setup = {
       description = "Prepare Sygnal runtime configuration";
@@ -216,6 +218,8 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
+        RuntimeDirectory = "mindroom-sygnal";
+        RuntimeDirectoryMode = "0750";
       };
       script = ''
         install -d -m 0750 /run/mindroom-sygnal
