@@ -36,6 +36,7 @@ from mindroom_fcm_pushkin import (
     FCM_ACCOUNT_KEY,
     FCM_CALL_CHANNEL_ID,
     FCM_MESSAGE_CHANNEL_ID,
+    FCM_SILENT_MESSAGE_CHANNEL_ID,
     MAX_ACCOUNT_BYTES,
     MindroomFcmPushkin,
 )
@@ -96,6 +97,9 @@ def _enc(hint: Any) -> Dict[str, Any]:
     return {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque", RING_HINT_KEY: hint}
 
 
+_DEFAULT_TWEAKS: Any = object()
+
+
 def _raw(
     *,
     event_type: Optional[str] = RTC_NOTIFICATION_TYPE,
@@ -107,11 +111,13 @@ def _raw(
     user_is_target: Optional[bool] = None,
     membership: Optional[str] = None,
     prio: str = "high",
-    tweaks: Optional[Dict[str, Any]] = None,
+    tweaks: Any = _DEFAULT_TWEAKS,
     default_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     dev: Dict[str, Any] = {"app_id": FCM_APP_ID, "pushkey": "fcm-device-token-123"}
-    if tweaks is not None:
+    if tweaks is _DEFAULT_TWEAKS:
+        dev["tweaks"] = {"sound": "default"}
+    elif tweaks is not None:
         dev["tweaks"] = tweaks
     if default_payload is not None:
         dev["data"] = {"default_payload": default_payload}
@@ -222,7 +228,7 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_fcm_rich_alert_wire_payloads(self) -> None:
         event_id_only = {
             "room_id": "!room:example.com", "event_id": "$e1", "prio": "low", "counts": {"unread": 1},
-            "devices": [{"app_id": FCM_APP_ID, "pushkey": "fcm-device-token-123"}],
+            "devices": [{"app_id": FCM_APP_ID, "pushkey": "fcm-device-token-123", "tweaks": {"sound": "default"}}],
         }
         md = "> <@b:e> old\n\n🔧 `sh` [1]\n**Deploy** [docs](https://mindroom.chat)"
         cases: List[Tuple[str, Dict[str, Any], str, str, bool, str]] = [
@@ -285,13 +291,35 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tag", msg_no_room["android"]["notification"])
         self.assertNotIn("room_id", msg_no_room["data"])
 
+        # Silent push rules (no sound tweak / empty / whitespace) use silent channel with no sound.
+        for label, silent_tweaks in (
+            ("omitted", None), ("empty_dict", {}), ("empty_str", {"sound": ""}), ("spaces", {"sound": "   "})
+        ):
+            with self.subTest(silent=label):
+                silent = await self._send_one(_msg("Quiet update", tweaks=silent_tweaks))
+                self.assertEqual(
+                    silent["android"]["notification"],
+                    {"channel_id": FCM_SILENT_MESSAGE_CHANNEL_ID, "tag": "!room:example.com"},
+                )
+
     async def test_fcm_options_precedence_and_badge_banner_stripping(self) -> None:
         rich_opts = {
             "notification": {"title": "Config Banner", "body": "Should not leak"},
             "data": {"top_opt": "top_val", "room_id": "!from-top:ex"},
             "android": {
                 "restricted_package_name": FCM_APP_ID,
-                "notification": {"icon": "ic_stat", "tag": "stale-tag"},
+                "notification": {
+                    "icon": "ic_stat",
+                    "color": "#112233",
+                    "sound": "custom.ogg",
+                    "tag": "stale-tag",
+                    "title": "Override Title",
+                    "body": "Override Body",
+                    "title_loc_key": "T_KEY",
+                    "title_loc_args": ["x"],
+                    "body_loc_key": "B_KEY",
+                    "body_loc_args": ["y"],
+                },
                 "data": {
                     "room_id": "!from-android:ex",
                     "event_id": "$from-android",
@@ -313,8 +341,28 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             _msg("**Hello**", default_payload={FCM_ACCOUNT_KEY: "@me:mindroom.chat"}), pushkin=pushkin
         )
         self.assertEqual(alert["notification"], {"title": "Alice", "body": "Hello"})
-        self.assertEqual(alert["android"]["notification"]["icon"], "ic_stat")
-        self.assertEqual(alert["android"]["notification"]["tag"], "!room:example.com")
+        self.assertEqual(
+            alert["android"]["notification"],
+            {
+                "icon": "ic_stat",
+                "color": "#112233",
+                "channel_id": FCM_MESSAGE_CHANNEL_ID,
+                "sound": "default",
+                "tag": "!room:example.com",
+            },
+        )
+
+        # Silent alert strips fcm_options android.notification.sound and title/body overrides too.
+        silent_alert = await self._send_one(_msg("Quiet", tweaks=None), pushkin=pushkin)
+        self.assertEqual(
+            silent_alert["android"]["notification"],
+            {
+                "icon": "ic_stat",
+                "color": "#112233",
+                "channel_id": FCM_SILENT_MESSAGE_CHANNEL_ID,
+                "tag": "!room:example.com",
+            },
+        )
         self.assertEqual(alert["data"]["room_id"], "!room:example.com")
         self.assertEqual(alert["data"]["event_id"], "$event1")
         self.assertEqual(alert["data"][FCM_ACCOUNT_KEY], "@me:mindroom.chat")
@@ -327,7 +375,16 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         ring = await self._send_one(
             _raw(content=_ring(self.now_ms, 30_000, "video"), tweaks={"sound": "ring"}), pushkin=pushkin
         )
-        self.assertEqual(ring["android"]["notification"]["channel_id"], FCM_CALL_CHANNEL_ID)
+        self.assertEqual(
+            ring["android"]["notification"],
+            {
+                "icon": "ic_stat",
+                "color": "#112233",
+                "channel_id": FCM_CALL_CHANNEL_ID,
+                "sound": "default",
+                "tag": "call:!room:example.com",
+            },
+        )
         self.assertEqual(
             json.loads(ring["data"][RING_PAYLOAD_KEY]),
             {"expires_at": self.now_ms + 30_000, "call_type": "video"},
@@ -412,7 +469,11 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 "priority": "high",
                 "ttl": "30s",
                 "restricted_package_name": FCM_APP_ID,
-                "notification": {"channel_id": FCM_CALL_CHANNEL_ID, "sound": "default", "tag": "!room:example.com"},
+                "notification": {
+                    "channel_id": FCM_CALL_CHANNEL_ID,
+                    "sound": "default",
+                    "tag": "call:!room:example.com",
+                },
             },
         )
         self.assertEqual(
@@ -420,11 +481,18 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             {"expires_at": self.now_ms + 30_000, "call_type": "voice"},
         )
 
-        # Sub-second remaining lifetime (0.8s) rounds up to "1s" instead of "0s".
+        # Sub-second remaining lifetime (0.8s) rounds up to "1s", and long call: tag is UTF-8 bounded.
         subsec = await self._send_one(
-            _raw(content=_ring(self.now_ms - 29_200, 30_000, "audio"), tweaks={"sound": "ring"})
+            _raw(
+                room_id="!" + ("é" * 200) + ":ex",
+                content=_ring(self.now_ms - 29_200, 30_000, "audio"),
+                tweaks={"sound": "ring"},
+            )
         )
         self.assertEqual(subsec["android"]["ttl"], "1s")
+        call_tag = subsec["android"]["notification"]["tag"]
+        self.assertTrue(call_tag.startswith("call:!"))
+        self.assertLessEqual(len(call_tag.encode("utf-8")), MAX_THREAD_ID_BYTES)
 
         video = await self._send_one(
             _raw(
@@ -452,13 +520,19 @@ class MindroomFcmPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(anon["notification"]["title"], "MindRoom")
 
-        for label, raw in (
-            ("no_ring_tweak", _raw(content=_ring(self.now_ms))),
-            ("future_skew", _raw(content=_ring(self.now_ms + MAX_CLOCK_SKEW_MS + 1), tweaks={"sound": "ring"})),
+        for label, raw, want_chan in (
+            ("no_ring_tweak_audible", _raw(content=_ring(self.now_ms)), FCM_MESSAGE_CHANNEL_ID),
+            ("no_ring_tweak_silent", _raw(content=_ring(self.now_ms), tweaks=None), FCM_SILENT_MESSAGE_CHANNEL_ID),
+            (
+                "future_skew",
+                _raw(content=_ring(self.now_ms + MAX_CLOCK_SKEW_MS + 1), tweaks={"sound": "ring"}),
+                FCM_MESSAGE_CHANNEL_ID,
+            ),
         ):
             with self.subTest(non_ring=label):
                 msg = await self._send_one(raw)
-                self.assertEqual(msg["android"]["notification"]["channel_id"], FCM_MESSAGE_CHANNEL_ID)
+                self.assertEqual(msg["android"]["notification"]["channel_id"], want_chan)
+                self.assertEqual(msg["android"]["notification"]["tag"], "!room:example.com")
                 self.assertNotIn(RING_PAYLOAD_KEY, msg["data"])
 
         self.sent_requests.clear()

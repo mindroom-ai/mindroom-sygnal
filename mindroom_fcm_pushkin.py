@@ -71,11 +71,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FCM_MESSAGE_CHANNEL_ID = "mindroom_messages"
+FCM_SILENT_MESSAGE_CHANNEL_ID = "mindroom_messages_silent"
 FCM_CALL_CHANNEL_ID = "mindroom_calls"
 FCM_ACCOUNT_KEY = "mindroom_account"
 FCM_DEFAULT_TITLE = "MindRoom"
 FCM_DEFAULT_BODY = "New message"
 MAX_ACCOUNT_BYTES = 256
+_FCM_RESERVED_ANDROID_NOTIF_KEYS = (
+    "title", "body", "title_loc_key", "title_loc_args", "body_loc_key", "body_loc_args",
+)
 
 # Gateway-owned and FCM-forbidden keys stripped from untrusted/config data maps.
 _FCM_RESERVED_DATA_KEYS = frozenset((
@@ -322,6 +326,7 @@ class MindroomFcmPushkin(GcmPushkin):
             n.user_is_target and n.membership == "invite"
         )
         channel_id: Optional[str] = None
+        has_sound = False
         if ring is not None or (not is_badge_only and not is_non_invite_member):
             sender_display_name, sender_id, room_display = _extract_display_fields(n)
             sender_clean = _clean_display_field(sender_id)
@@ -338,6 +343,7 @@ class MindroomFcmPushkin(GcmPushkin):
                 }
                 android["ttl"] = _ring_ttl_str(ring_expires_at, now)
                 channel_id = FCM_CALL_CHANNEL_ID
+                has_sound = True
                 data[RING_PAYLOAD_KEY] = json.dumps(
                     {"expires_at": ring_expires_at, "call_type": "video" if is_video else "voice"},
                     separators=(",", ":"),
@@ -347,7 +353,9 @@ class MindroomFcmPushkin(GcmPushkin):
                     n, sender_display_name or sender_clean, room_display
                 )
                 message["notification"] = {"title": title, "body": body_text}
-                channel_id = FCM_MESSAGE_CHANNEL_ID
+                sound_tweak = device.tweaks.sound
+                has_sound = isinstance(sound_tweak, str) and bool(sound_tweak.strip())
+                channel_id = FCM_MESSAGE_CHANNEL_ID if has_sound else FCM_SILENT_MESSAGE_CHANNEL_ID
                 if is_plain:
                     data[PLAIN_PAYLOAD_KEY] = "1"
 
@@ -357,9 +365,16 @@ class MindroomFcmPushkin(GcmPushkin):
                 if isinstance(android.get("notification"), dict)
                 else {}
             )
-            an.update(channel_id=channel_id, sound="default")
+            for key in _FCM_RESERVED_ANDROID_NOTIF_KEYS:
+                an.pop(key, None)
+            an["channel_id"] = channel_id
+            if has_sound:
+                an["sound"] = "default"
+            else:
+                an.pop("sound", None)
             if room_id is not None:
-                an["tag"] = _truncate_utf8(room_id, MAX_THREAD_ID_BYTES)
+                tag_src = f"call:{room_id}" if ring is not None else room_id
+                an["tag"] = _truncate_utf8(tag_src, MAX_THREAD_ID_BYTES)
             else:
                 an.pop("tag", None)
             android["notification"] = an
@@ -383,7 +398,7 @@ class MindroomFcmPushkin(GcmPushkin):
         self, n: Notification, device: Device, context: NotificationContext
     ) -> List[str]:
         log = NotificationLoggerAdapter(logger, {"request_id": context.request_id})
-        pushkeys = [device.pushkey]
+        pushkey = device.pushkey
         with self.sygnal.tracer.start_span(
             "gcm_dispatch", tags={"gcm_num_devices": 1}, child_of=context.opentracing_span
         ) as span_parent:
@@ -396,7 +411,7 @@ class MindroomFcmPushkin(GcmPushkin):
                 log.warning(
                     "Rejecting pushkey(s) due to misconfigured default_payload (expected dict)."
                 )
-                return pushkeys
+                return [pushkey]
 
             built = self._build_v1_payload(n, device, default_payload, log)
             if built is None:
@@ -410,7 +425,6 @@ class MindroomFcmPushkin(GcmPushkin):
                 span_parent.set_tag("gcm_num_failed", 0)
                 return []
 
-            failed: List[str] = []
             for retry_number in range(MAX_TRIES):
                 if ring_expires_at is not None and ring_expires_at <= mindroom_pushkin.now_ms():
                     return _drop_expired()
@@ -436,7 +450,7 @@ class MindroomFcmPushkin(GcmPushkin):
 
                 log.info(
                     "Sending (attempt %i) => %r room:%s, event:%s",
-                    retry_number, pushkeys, n.room_id, n.event_id,
+                    retry_number, [pushkey], n.room_id, n.event_id,
                 )
                 try:
                     with self.sygnal.tracer.start_span(
@@ -444,12 +458,11 @@ class MindroomFcmPushkin(GcmPushkin):
                         tags={"retry_num": retry_number},
                         child_of=span_parent,
                     ) as span:
-                        new_failed, pushkeys = await self._request_dispatch(
-                            n, log, send_body, headers, pushkeys, span
+                        failed, _ = await self._request_dispatch(
+                            n, log, send_body, headers, [pushkey], span
                         )
-                    failed += new_failed
-                    if not pushkeys:
-                        break
+                    span_parent.set_tag("gcm_num_failed", len(failed))
+                    return failed
                 except (
                     TemporaryNotificationDispatchException,
                     NotificationQuotaDispatchException,
@@ -478,7 +491,6 @@ class MindroomFcmPushkin(GcmPushkin):
                     span_parent.log_kv({"event": "temporary_fail", "retrying_in": retry_delay})
                     await twisted_sleep(retry_delay, twisted_reactor=self.sygnal.reactor)
 
-            if pushkeys:
-                log.info("Gave up retrying reg IDs: %r", pushkeys)
-            span_parent.set_tag("gcm_num_failed", len(failed))
-            return failed
+            log.info("Gave up retrying reg IDs: %r", [pushkey])
+            span_parent.set_tag("gcm_num_failed", 0)
+            return []
