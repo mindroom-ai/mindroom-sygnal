@@ -1,0 +1,77 @@
+# Enforced module boundaries and external Sygnal pushkin entrypoints.
+exclude = [
+    "**/*__pycache__",
+    "**/*egg-info",
+    "**/.ruff_cache",
+    "**/.venv",
+    "**/venv",
+    "test_*.py",
+]
+source_roots = ["."]
+exact = true
+
+[[modules]]
+path = "mindroom_pushkin"
+depends_on = []
+
+# External Sygnal pushkin entrypoint.
+[[interfaces]]
+from = ["mindroom_pushkin"]
+expose = [
+    "MindroomApnsPushkin",
+]
+
+# Shared notification/ring helpers consumed by the FCM pushkin.
+[[interfaces]]
+from = ["mindroom_pushkin"]
+expose = [
+    "CONTROL_CHARS_RE",
+    "LONE_SURROGATE_RE",
+    "MAX_ALERT_TITLE_BYTES",
+    "MAX_ROOM_NAME_BYTES",
+    "MAX_SENDER_DISPLAY_NAME_BYTES",
+    "MAX_STRIP_CHARS",
+    "MAX_THREAD_ID_BYTES",
+    "MIN_PREVIEW_BYTES",
+    "PLAIN_PAYLOAD_KEY",
+    "RESERVED_PAYLOAD_KEYS",
+    "RING_PAYLOAD_KEY",
+    "RING_TWEAK_SOUND",
+    "TOOL_APPROVAL_TYPE",
+    "clean_display_field",
+    "drop_event_reason",
+    "extract_display_fields",
+    "format_tool_approval_body",
+    "json_str_bytes",
+    "now_ms",
+    "ring_expires_at",
+    "ring_of",
+    "scrub_surrogates",
+    "strip_markdown",
+    "truncate_utf8",
+]
+visibility = ["mindroom_fcm_pushkin"]
+
+[[modules]]
+path = "mindroom_fcm_pushkin"
+depends_on = ["mindroom_pushkin"]
+
+# External Sygnal pushkin entrypoint.
+[[interfaces]]
+from = ["mindroom_fcm_pushkin"]
+expose = [
+    "MindroomFcmPushkin",
+]
+
+# Loads pushkins dynamically via importlib with fallback to stock Sygnal pushkins.
+[[modules]]
+path = "mindroom_pushkin_loader"
+depends_on = []
+
+# External Sygnal loader entrypoints.
+[[interfaces]]
+from = ["mindroom_pushkin_loader"]
+expose = [
+    "SafeApnsPushkin",
+    "SafeFcmPushkin",
+]

@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    name: Lint, boundaries & module privacy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Run ruff, tach, and privata
+        run: |
+          uvx ruff check .
+          uvx ruff format --check .
+          uvx tach check
+          uvx privata --methods .
+
   pushkin-tests:
     name: Sygnal v0.17.0 pushkin tests
     runs-on: ubuntu-latest

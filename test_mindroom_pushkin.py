@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2026 MindRoom contributors
 #
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -24,45 +23,46 @@ import logging
 import random
 import time
 import unittest
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from aioapns import NotificationRequest
 from aioapns.common import NotificationResult
-from twisted.internet.defer import ensureDeferred
-from twisted.internet.testing import MemoryReactorClock
-
-import mindroom_pushkin
-from mindroom_pushkin import (
-    ENCRYPTED_EVENT_TYPE,
-    MAX_ALERT_SUBTITLE_BYTES,
-    MAX_ALERT_TITLE_BYTES,
-    MAX_CLOCK_SKEW_MS,
-    MAX_RING_LIFETIME_MS,
-    MAX_ROOM_NAME_BYTES,
-    MAX_SENDER_BYTES,
-    MAX_SENDER_DISPLAY_NAME_BYTES,
-    MAX_THREAD_ID_BYTES,
-    MAX_TOOL_APPROVAL_BODY_BYTES,
-    MIN_PREVIEW_BYTES,
-    PLAIN_PAYLOAD_KEY,
-    REDACTION_EVENT_TYPE,
-    RING_HINT_KEY,
-    RING_PAYLOAD_KEY,
-    RING_SOUND,
-    RTC_NOTIFICATION_TYPE,
-    TOOL_APPROVAL_TYPE,
-    MindroomApnsPushkin,
-    _clean_display_field,
-    _truncate_utf8,
-    strip_markdown,
-)
 from sygnal import apnstruncate
 from sygnal.apnspushkin import ApnsPushkin
 from sygnal.apnstruncate import BodyTooLongException
 from sygnal.notifications import Notification, NotificationContext
 from sygnal.sygnal import CONFIG_DEFAULTS, Sygnal, merge_left_with_defaults
 from sygnal.utils import NotificationLoggerAdapter
+from twisted.internet.defer import ensureDeferred
+from twisted.internet.testing import MemoryReactorClock
+
+import mindroom_pushkin
+from mindroom_pushkin import (
+    _ENCRYPTED_EVENT_TYPE,
+    _MAX_ALERT_SUBTITLE_BYTES,
+    _MAX_CLOCK_SKEW_MS,
+    _MAX_RING_LIFETIME_MS,
+    _MAX_SENDER_BYTES,
+    _MAX_TOOL_APPROVAL_BODY_BYTES,
+    _REDACTION_EVENT_TYPE,
+    _RING_HINT_KEY,
+    _RING_SOUND,
+    _RTC_NOTIFICATION_TYPE,
+    MAX_ALERT_TITLE_BYTES,
+    MAX_ROOM_NAME_BYTES,
+    MAX_SENDER_DISPLAY_NAME_BYTES,
+    MAX_THREAD_ID_BYTES,
+    MIN_PREVIEW_BYTES,
+    PLAIN_PAYLOAD_KEY,
+    RING_PAYLOAD_KEY,
+    TOOL_APPROVAL_TYPE,
+    MindroomApnsPushkin,
+    clean_display_field,
+    strip_markdown,
+    truncate_utf8,
+)
 
 APP_ID = "chat.mindroom.app"
 STOCK_APP_ID = "chat.mindroom.app.stock"
@@ -72,10 +72,10 @@ BASE_NOW_MS = 1_795_300_000_000
 
 def _dev(
     app_id: str = APP_ID,
-    tweaks: Optional[Dict[str, Any]] = None,
-    default_payload: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    d: Dict[str, Any] = {"app_id": app_id, "pushkey": "deadbeef0123", "pushkey_ts": 42}
+    tweaks: dict[str, Any] | None = None,
+    default_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    d: dict[str, Any] = {"app_id": app_id, "pushkey": "deadbeef0123", "pushkey_ts": 42}
     if tweaks is not None:
         d["tweaks"] = tweaks
     if default_payload is not None:
@@ -85,20 +85,20 @@ def _dev(
 
 def _raw(
     *,
-    event_type: Optional[str] = RTC_NOTIFICATION_TYPE,
-    content: Optional[Dict[str, Any]] = None,
-    sender: Optional[str] = "@alice:example.com",
-    sender_display_name: Optional[str] = "Alice",
-    room_name: Optional[str] = None,
-    room_alias: Optional[str] = None,
-    room_id: Optional[str] = "!room:example.com",
-    user_is_target: Optional[bool] = None,
-    membership: Optional[str] = None,
+    event_type: str | None = _RTC_NOTIFICATION_TYPE,
+    content: dict[str, Any] | None = None,
+    sender: str | None = "@alice:example.com",
+    sender_display_name: str | None = "Alice",
+    room_name: str | None = None,
+    room_alias: str | None = None,
+    room_id: str | None = "!room:example.com",
+    user_is_target: bool | None = None,
+    membership: str | None = None,
     prio: str = "high",
-    tweaks: Optional[Dict[str, Any]] = None,
-    default_payload: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    raw: Dict[str, Any] = {
+    tweaks: dict[str, Any] | None = None,
+    default_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw: dict[str, Any] = {
         "event_id": "$event1",
         "prio": prio,
         "counts": {"unread": 1},
@@ -125,8 +125,8 @@ def _raw(
     return raw
 
 
-def _ring(sender_ts: int, lifetime: int = 30_000, intent: Optional[str] = "audio") -> Dict[str, Any]:
-    fields: Dict[str, Any] = {
+def _ring(sender_ts: int, lifetime: int = 30_000, intent: str | None = "audio") -> dict[str, Any]:
+    fields: dict[str, Any] = {
         "notification_type": "ring",
         "sender_ts": sender_ts,
         "lifetime": lifetime,
@@ -136,13 +136,13 @@ def _ring(sender_ts: int, lifetime: int = 30_000, intent: Optional[str] = "audio
     return fields
 
 
-def _enc(hint: Any) -> Dict[str, Any]:
-    return {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque", RING_HINT_KEY: hint}
+def _enc(hint: Any) -> dict[str, Any]:
+    return {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque", _RING_HINT_KEY: hint}
 
 
 # Every gateway-owned field a pusher could try to pre-seed through default_payload.
 # All spoofed values contain "spoof" so tests can assert none of them survive.
-SPOOFED_DEFAULT_PAYLOAD: Dict[str, Any] = {
+SPOOFED_DEFAULT_PAYLOAD: dict[str, Any] = {
     "sender": "@spoof:evil.example",
     "sender_display_name": "Spoofed Admin",
     "room_name": "Spoofed Room",
@@ -166,7 +166,7 @@ SPOOFED_DEFAULT_PAYLOAD: Dict[str, Any] = {
         },
     },
 }
-REAL_IDENTITY: Dict[str, Any] = {
+REAL_IDENTITY: dict[str, Any] = {
     "sender": "@real:example.com",
     "sender_display_name": "Real User",
     "room_name": "Real Room",
@@ -174,13 +174,11 @@ REAL_IDENTITY: Dict[str, Any] = {
 }
 
 
-def _json_size(message: Dict[str, Any]) -> int:
+def _json_size(message: dict[str, Any]) -> int:
     return len(json.dumps(message, ensure_ascii=False).encode("utf-8"))
 
 
-def _without_reserved_fields(
-    stock_payload: Dict[str, Any], *, homeserver_sent_room_id: bool = True
-) -> Dict[str, Any]:
+def _without_reserved_fields(stock_payload: dict[str, Any], *, homeserver_sent_room_id: bool = True) -> dict[str, Any]:
     """Return a stock payload minus every gateway-owned field."""
     payload = copy.deepcopy(stock_payload)
     for key in ("sender", "sender_display_name", "room_name", RING_PAYLOAD_KEY, PLAIN_PAYLOAD_KEY):
@@ -400,9 +398,7 @@ class StripMarkdownTestCase(unittest.TestCase):
         ):
             with self.subTest(raw=raw):
                 stripped = strip_markdown(raw)
-                self.assertFalse(
-                    any("\ue000" <= char <= "\uf8ff" for char in stripped), repr(stripped)
-                )
+                self.assertFalse(any("\ue000" <= char <= "\uf8ff" for char in stripped), repr(stripped))
 
     def test_pathological_inputs_are_fast_and_bounded(self) -> None:
         patterns = [
@@ -433,16 +429,16 @@ class StripMarkdownTestCase(unittest.TestCase):
         )
 
     def test_truncate_utf8(self) -> None:
-        self.assertEqual(_truncate_utf8("hello", 10), "hello")
-        self.assertEqual(_truncate_utf8("hello", 3), "hel")
-        self.assertEqual(_truncate_utf8("hello", 0), "")
-        self.assertEqual(_truncate_utf8("😀😀😀", 5), "😀")
-        self.assertEqual(_truncate_utf8("😀😀😀", 8), "😀😀")
-        self.assertEqual(_truncate_utf8("😀", 3), "")
-        self.assertEqual(_truncate_utf8("café", 4), "caf")
-        self.assertEqual(_truncate_utf8("café", 5), "café")
+        self.assertEqual(truncate_utf8("hello", 10), "hello")
+        self.assertEqual(truncate_utf8("hello", 3), "hel")
+        self.assertEqual(truncate_utf8("hello", 0), "")
+        self.assertEqual(truncate_utf8("😀😀😀", 5), "😀")
+        self.assertEqual(truncate_utf8("😀😀😀", 8), "😀😀")
+        self.assertEqual(truncate_utf8("😀", 3), "")
+        self.assertEqual(truncate_utf8("café", 4), "caf")
+        self.assertEqual(truncate_utf8("café", 5), "café")
         # JSON-escaped quotes count as 2 bytes each (\")
-        truncated_quotes = _truncate_utf8('"' * 300, 256)
+        truncated_quotes = truncate_utf8('"' * 300, 256)
         self.assertEqual(len(truncated_quotes), 128)
         self.assertLessEqual(
             len(json.dumps(truncated_quotes, ensure_ascii=False).encode("utf-8")) - 2,
@@ -450,22 +446,22 @@ class StripMarkdownTestCase(unittest.TestCase):
         )
 
     def test_lone_surrogates_are_replaced_not_raised(self) -> None:
-        self.assertEqual(_truncate_utf8("a\ud800b", 10), "a\ufffdb")
-        self.assertEqual(_truncate_utf8("\udfff" * 4, 6), "\ufffd\ufffd")
-        self.assertEqual(_truncate_utf8("@al\ud83dice:example.com", 256), "@al\ufffdice:example.com")
-        self.assertEqual(_clean_display_field("Al\ud83dice\x01"), "Al\ufffdice")
+        self.assertEqual(truncate_utf8("a\ud800b", 10), "a\ufffdb")
+        self.assertEqual(truncate_utf8("\udfff" * 4, 6), "\ufffd\ufffd")
+        self.assertEqual(truncate_utf8("@al\ud83dice:example.com", 256), "@al\ufffdice:example.com")
+        self.assertEqual(clean_display_field("Al\ud83dice\x01"), "Al\ufffdice")
         # A well-formed astral character is one code point, not a surrogate pair.
-        self.assertEqual(_truncate_utf8("😀", 4), "😀")
-        self.assertEqual(_clean_display_field("😀"), "😀")
+        self.assertEqual(truncate_utf8("😀", 4), "😀")
+        self.assertEqual(clean_display_field("😀"), "😀")
 
 
 class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.now_ms = BASE_NOW_MS
         self.reactor = MemoryReactorClock()
-        self.sent: Dict[str, List[NotificationRequest]] = {APP_ID: [], STOCK_APP_ID: []}
-        self.send_handler: Callable[[NotificationRequest], NotificationResult] = (
-            lambda req: NotificationResult(req.notification_id, "200")
+        self.sent: dict[str, list[NotificationRequest]] = {APP_ID: [], STOCK_APP_ID: []}
+        self.send_handler: Callable[[NotificationRequest], NotificationResult] = lambda req: NotificationResult(
+            req.notification_id, "200"
         )
 
         def _make_apns(*args: Any, **kwargs: Any) -> MagicMock:
@@ -507,7 +503,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.pushkin, MindroomApnsPushkin)
         self.assertIs(type(self.stock), ApnsPushkin)
 
-    async def _await(self, coro: Any, *, advance: Optional[List[int]] = None) -> Any:
+    async def _await(self, coro: Any, *, advance: list[int] | None = None) -> Any:
         fut = ensureDeferred(coro).asFuture(asyncio.get_running_loop())
         for secs in advance or []:
             await asyncio.sleep(0)
@@ -522,9 +518,9 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self,
         notif: Notification,
         *,
-        pushkin: Optional[ApnsPushkin] = None,
-        advance: Optional[List[int]] = None,
-    ) -> List[str]:
+        pushkin: ApnsPushkin | None = None,
+        advance: list[int] | None = None,
+    ) -> list[str]:
         ctx = NotificationContext(
             request_id="req-1",
             opentracing_span=self.sygnal.tracer.start_span("test"),
@@ -535,23 +531,21 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             advance=advance,
         )
 
-    async def _send(self, raw: Dict[str, Any], *, stock: bool = False) -> Optional[Dict[str, Any]]:
+    async def _send(self, raw: dict[str, Any], *, stock: bool = False) -> dict[str, Any] | None:
         """Dispatch ``raw`` and return the APNs message, or None if Sygnal found it too long."""
         raw = copy.deepcopy(raw)
         app_id = STOCK_APP_ID if stock else APP_ID
         raw["devices"][0]["app_id"] = app_id
         self.sent[app_id].clear()
         try:
-            rejected = await self._dispatch(
-                Notification(raw), pushkin=self.stock if stock else self.pushkin
-            )
+            rejected = await self._dispatch(Notification(raw), pushkin=self.stock if stock else self.pushkin)
         except BodyTooLongException:
             return None
         self.assertEqual(rejected, [])
         self.assertEqual(len(self.sent[app_id]), 1)
         return self.sent[app_id][0].message
 
-    def _stock_payload(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+    def _stock_payload(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Return the untruncated payload stock ApnsPushkin builds for ``raw``."""
         notif = Notification(copy.deepcopy(raw))
         log = NotificationLoggerAdapter(logging.getLogger(__name__), {"request_id": "req-stock"})
@@ -562,15 +556,101 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_valid_rings(self) -> None:
         t = self.now_ms
         cases = [
-            ("clear_audio", _raw(content=_ring(t - 2_000), tweaks={"sound": "ring"}, default_payload={"aps": {"sound": "default", "mutable-content": 1}}), "VOICE_CALL_FROM_USER", "Alice", t + 28_000, 28),
-            ("hint_audio_named_room", _raw(event_type=ENCRYPTED_EVENT_TYPE, room_name="Small Group", content=_enc(_ring(t - 1_500)), tweaks={"sound": "ring"}), "VOICE_CALL_FROM_USER", "Alice", t + 28_500, 28),
-            ("clear_video", _raw(sender_display_name="Test Caller", content=_ring(t - 1_000, intent="video"), tweaks={"sound": "ring"}), "VIDEO_CALL_FROM_USER", "Test Caller", t + 29_000, 29),
-            ("hint_video", _raw(event_type=ENCRYPTED_EVENT_TYPE, sender_display_name="Test Caller", content=_enc(_ring(t - 1_000, intent="video")), tweaks={"sound": "ring"}), "VIDEO_CALL_FROM_USER", "Test Caller", t + 29_000, 29),
-            ("omitted_intent_sender_fallback", _raw(sender="@bob:example.com", sender_display_name="", content=_ring(t, intent=None), tweaks={"sound": "ring"}), "VOICE_CALL_FROM_USER", "@bob:example.com", t + 30_000, 30),
-            ("missing_sender_fallback", _raw(sender=None, sender_display_name=None, content=_ring(t, intent=None), tweaks={"sound": "ring"}), "VOICE_CALL_FROM_USER", " ", t + 30_000, 30),
-            ("long_name_truncated", _raw(sender_display_name="A" * 2000, content=_ring(t), tweaks={"sound": "ring"}), "VOICE_CALL_FROM_USER", "A" * self.pushkin.MAX_FIELD_LENGTH, t + 30_000, 30),
-            ("low_prio_override_and_life_cap", _raw(prio="low", content=_ring(t, lifetime=600_000), tweaks={"sound": "ring"}), "VOICE_CALL_FROM_USER", "Alice", t + MAX_RING_LIFETIME_MS, 120),
-            ("clock_skew_boundary", _raw(content=_ring(t + MAX_CLOCK_SKEW_MS), tweaks={"sound": "ring"}), "VOICE_CALL_FROM_USER", "Alice", t + MAX_CLOCK_SKEW_MS + 30_000, 50),
+            (
+                "clear_audio",
+                _raw(
+                    content=_ring(t - 2_000),
+                    tweaks={"sound": "ring"},
+                    default_payload={"aps": {"sound": "default", "mutable-content": 1}},
+                ),
+                "VOICE_CALL_FROM_USER",
+                "Alice",
+                t + 28_000,
+                28,
+            ),
+            (
+                "hint_audio_named_room",
+                _raw(
+                    event_type=_ENCRYPTED_EVENT_TYPE,
+                    room_name="Small Group",
+                    content=_enc(_ring(t - 1_500)),
+                    tweaks={"sound": "ring"},
+                ),
+                "VOICE_CALL_FROM_USER",
+                "Alice",
+                t + 28_500,
+                28,
+            ),
+            (
+                "clear_video",
+                _raw(
+                    sender_display_name="Test Caller",
+                    content=_ring(t - 1_000, intent="video"),
+                    tweaks={"sound": "ring"},
+                ),
+                "VIDEO_CALL_FROM_USER",
+                "Test Caller",
+                t + 29_000,
+                29,
+            ),
+            (
+                "hint_video",
+                _raw(
+                    event_type=_ENCRYPTED_EVENT_TYPE,
+                    sender_display_name="Test Caller",
+                    content=_enc(_ring(t - 1_000, intent="video")),
+                    tweaks={"sound": "ring"},
+                ),
+                "VIDEO_CALL_FROM_USER",
+                "Test Caller",
+                t + 29_000,
+                29,
+            ),
+            (
+                "omitted_intent_sender_fallback",
+                _raw(
+                    sender="@bob:example.com",
+                    sender_display_name="",
+                    content=_ring(t, intent=None),
+                    tweaks={"sound": "ring"},
+                ),
+                "VOICE_CALL_FROM_USER",
+                "@bob:example.com",
+                t + 30_000,
+                30,
+            ),
+            (
+                "missing_sender_fallback",
+                _raw(sender=None, sender_display_name=None, content=_ring(t, intent=None), tweaks={"sound": "ring"}),
+                "VOICE_CALL_FROM_USER",
+                " ",
+                t + 30_000,
+                30,
+            ),
+            (
+                "long_name_truncated",
+                _raw(sender_display_name="A" * 2000, content=_ring(t), tweaks={"sound": "ring"}),
+                "VOICE_CALL_FROM_USER",
+                "A" * self.pushkin.MAX_FIELD_LENGTH,
+                t + 30_000,
+                30,
+            ),
+            (
+                "low_prio_override_and_life_cap",
+                _raw(prio="low", content=_ring(t, lifetime=600_000), tweaks={"sound": "ring"}),
+                "VOICE_CALL_FROM_USER",
+                "Alice",
+                t + _MAX_RING_LIFETIME_MS,
+                120,
+            ),
+            (
+                "clock_skew_boundary",
+                _raw(content=_ring(t + _MAX_CLOCK_SKEW_MS), tweaks={"sound": "ring"}),
+                "VOICE_CALL_FROM_USER",
+                "Alice",
+                t + _MAX_CLOCK_SKEW_MS + 30_000,
+                50,
+            ),
         ]
         for label, raw, loc_key, name, exp, ttl in cases:
             with self.subTest(case=label):
@@ -581,7 +661,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(req.priority, 10)
                 self.assertEqual(req.time_to_live, ttl)
                 self.assertEqual(req.message["aps"]["alert"], {"loc-key": loc_key, "loc-args": [name]})
-                self.assertEqual(req.message["aps"]["sound"], RING_SOUND)
+                self.assertEqual(req.message["aps"]["sound"], _RING_SOUND)
                 self.assertEqual(req.message[RING_PAYLOAD_KEY], {"expires_at": exp})
                 self.assertNotIn("thread-id", req.message["aps"])
                 self.assertNotIn("sender", req.message)
@@ -590,7 +670,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_badge_only_and_event_id_only_match_stock(self) -> None:
         rt = {"sound": "ring"}
-        cases: List[Tuple[str, Dict[str, Any]]] = [
+        cases: list[tuple[str, dict[str, Any]]] = [
             ("badge_only", {"type": None, "sender": "", "counts": {"unread": 2}, "devices": [_dev(tweaks=rt)]}),
             (
                 "badge_only_with_default_payload",
@@ -619,7 +699,12 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                     "event_id": "$e2",
                     "prio": "low",
                     "counts": {"unread": 3},
-                    "devices": [_dev(tweaks=rt, default_payload={"aps": {"mutable-content": 1}, RING_PAYLOAD_KEY: {"expires_at": 1}})],
+                    "devices": [
+                        _dev(
+                            tweaks=rt,
+                            default_payload={"aps": {"mutable-content": 1}, RING_PAYLOAD_KEY: {"expires_at": 1}},
+                        )
+                    ],
                 },
             ),
             (
@@ -692,23 +777,93 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         valid = _ring(t)
         rt = {"sound": "ring"}
         dp = {"aps": {"sound": "default"}}
-        cases: List[Tuple[str, Dict[str, Any]]] = [
-            ("msg_low_prio", _raw(event_type="m.room.message", content={"msgtype": "m.text", "body": "Hi"}, prio="low")),
-            ("encrypted_no_hint", _raw(event_type=ENCRYPTED_EVENT_TYPE, content={"algorithm": "m.megolm.v1.aes-sha2"}, tweaks=rt, default_payload=dp)),
-            ("group_notif_clear", _raw(content={**valid, "notification_type": "notification"}, tweaks=rt, default_payload=dp)),
-            ("group_notif_hint", _raw(event_type=ENCRYPTED_EVENT_TYPE, content=_enc({**valid, "notification_type": "notification"}), tweaks=rt, default_payload=dp)),
-            ("legacy_invite_audio", _raw(event_type="m.call.invite", content={**valid, "offer": {"sdp": "v=0\r\nm=audio 9\r\n"}}, tweaks=rt, default_payload=dp)),
-            ("legacy_invite_video", _raw(event_type="m.call.invite", content={**valid, "offer": {"sdp": "v=0\r\nm=video 9\r\n"}}, tweaks=rt, default_payload=dp)),
-            ("wrong_wire_msg_top", _raw(event_type="m.room.message", content={**valid, "msgtype": "m.text", "body": "hi"}, tweaks=rt, default_payload=dp)),
-            ("wrong_wire_msg_hint", _raw(event_type="m.room.message", content={"msgtype": "m.text", "body": "hi", RING_HINT_KEY: valid}, tweaks=rt, default_payload=dp)),
-            ("wrong_wire_rtc_nested", _raw(content={RING_HINT_KEY: valid}, tweaks=rt, default_payload=dp)),
-            ("wrong_wire_enc_top", _raw(event_type=ENCRYPTED_EVENT_TYPE, content={**valid, "algorithm": "m.megolm.v1.aes-sha2"}, tweaks=rt, default_payload=dp)),
+        cases: list[tuple[str, dict[str, Any]]] = [
+            (
+                "msg_low_prio",
+                _raw(event_type="m.room.message", content={"msgtype": "m.text", "body": "Hi"}, prio="low"),
+            ),
+            (
+                "encrypted_no_hint",
+                _raw(
+                    event_type=_ENCRYPTED_EVENT_TYPE,
+                    content={"algorithm": "m.megolm.v1.aes-sha2"},
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
+            (
+                "group_notif_clear",
+                _raw(content={**valid, "notification_type": "notification"}, tweaks=rt, default_payload=dp),
+            ),
+            (
+                "group_notif_hint",
+                _raw(
+                    event_type=_ENCRYPTED_EVENT_TYPE,
+                    content=_enc({**valid, "notification_type": "notification"}),
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
+            (
+                "legacy_invite_audio",
+                _raw(
+                    event_type="m.call.invite",
+                    content={**valid, "offer": {"sdp": "v=0\r\nm=audio 9\r\n"}},
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
+            (
+                "legacy_invite_video",
+                _raw(
+                    event_type="m.call.invite",
+                    content={**valid, "offer": {"sdp": "v=0\r\nm=video 9\r\n"}},
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
+            (
+                "wrong_wire_msg_top",
+                _raw(
+                    event_type="m.room.message",
+                    content={**valid, "msgtype": "m.text", "body": "hi"},
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
+            (
+                "wrong_wire_msg_hint",
+                _raw(
+                    event_type="m.room.message",
+                    content={"msgtype": "m.text", "body": "hi", _RING_HINT_KEY: valid},
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
+            ("wrong_wire_rtc_nested", _raw(content={_RING_HINT_KEY: valid}, tweaks=rt, default_payload=dp)),
+            (
+                "wrong_wire_enc_top",
+                _raw(
+                    event_type=_ENCRYPTED_EVENT_TYPE,
+                    content={**valid, "algorithm": "m.megolm.v1.aes-sha2"},
+                    tweaks=rt,
+                    default_payload=dp,
+                ),
+            ),
             ("wrong_wire_unknown", _raw(event_type="com.example.custom", content=valid, tweaks=rt, default_payload=dp)),
             ("no_tweak", _raw(content=valid, tweaks=None, default_payload=dp)),
             ("other_tweak", _raw(content=valid, tweaks={"sound": "default"}, default_payload=dp)),
-            ("malformed_hint", _raw(event_type=ENCRYPTED_EVENT_TYPE, content=_enc("not-a-dict"), tweaks=rt)),
+            ("malformed_hint", _raw(event_type=_ENCRYPTED_EVENT_TYPE, content=_enc("not-a-dict"), tweaks=rt)),
             ("missing_content", _raw(content=None, tweaks=rt)),
-            ("caller_ring_field_full", _raw(event_type="m.room.message", content={"msgtype": "m.text", "body": "Hi"}, prio="low", default_payload={**dp, RING_PAYLOAD_KEY: {"expires_at": 1}})),
+            (
+                "caller_ring_field_full",
+                _raw(
+                    event_type="m.room.message",
+                    content={"msgtype": "m.text", "body": "Hi"},
+                    prio="low",
+                    default_payload={**dp, RING_PAYLOAD_KEY: {"expires_at": 1}},
+                ),
+            ),
         ]
         bad_ts = [
             ("missing_ts", {"notification_type": "ring", "lifetime": 30_000}),
@@ -722,7 +877,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             ("neg_ts", {"notification_type": "ring", "sender_ts": -1_000, "lifetime": 30_000}),
             ("zero_life", {"notification_type": "ring", "sender_ts": t, "lifetime": 0}),
             ("neg_life", {"notification_type": "ring", "sender_ts": t, "lifetime": -5_000}),
-            ("far_future", {"notification_type": "ring", "sender_ts": t + MAX_CLOCK_SKEW_MS + 1, "lifetime": 30_000}),
+            ("far_future", {"notification_type": "ring", "sender_ts": t + _MAX_CLOCK_SKEW_MS + 1, "lifetime": 30_000}),
         ]
         cases.extend((f"bad_ts_{k}", _raw(content=c, tweaks=rt, default_payload=dp)) for k, c in bad_ts)
 
@@ -743,7 +898,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(got.time_to_live, want.time_to_live)
                 self.assertIsNone(got.time_to_live)
                 self.assertEqual(got.message["aps"].get("sound"), want.message["aps"].get("sound"))
-                self.assertNotEqual(got.message["aps"].get("sound"), RING_SOUND)
+                self.assertNotEqual(got.message["aps"].get("sound"), _RING_SOUND)
                 # Only a validated ring may carry mindroom_ring: a caller-supplied one is
                 # stripped (unlike stock) so the iOS extension never treats a message as a ring.
                 self.assertNotIn(RING_PAYLOAD_KEY, got.message)
@@ -927,7 +1082,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(msg["sender"], "@alice:example.com")
 
         # Forced to the stock fallback, the action text is neither stripped nor marked.
-        def _emote(pad: int) -> Dict[str, Any]:
+        def _emote(pad: int) -> dict[str, Any]:
             return _raw(
                 event_type="m.room.message",
                 content={"msgtype": "m.emote", "body": "tests `**kwargs**`"},
@@ -945,12 +1100,12 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_internal_and_redaction_events_are_dropped(self) -> None:
         oversized = {"aps": {"sound": "default"}, "pad": "x" * 5000}
-        cases: List[Tuple[str, str, Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]] = [
+        cases: list[tuple[str, str, dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]] = [
             ("active_runs", "io.mindroom.active_runs", {"runs": []}, None, None),
             ("background_jobs", "io.mindroom.background_jobs", {"jobs": []}, None, None),
             ("scheduled_task", "com.mindroom.scheduled.task", {"task_id": "t1"}, None, None),
             ("tool_approval_response", "io.mindroom.tool_approval_response", {"decision": "approve"}, None, None),
-            ("redaction", REDACTION_EVENT_TYPE, {"redacts": "$evt0"}, {"sound": "ring"}, oversized),
+            ("redaction", _REDACTION_EVENT_TYPE, {"redacts": "$evt0"}, {"sound": "ring"}, oversized),
         ]
         log = NotificationLoggerAdapter(logging.getLogger(__name__), {"request_id": "req-drop"})
         for label, event_type, content, tweaks, default_payload in cases:
@@ -970,7 +1125,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.sent[APP_ID], [])
 
     async def test_non_pending_tool_approval_is_dropped(self) -> None:
-        cases: List[Tuple[str, Any]] = [
+        cases: list[tuple[str, Any]] = [
             ("approved", {"status": "approved", "tool_name": "shell"}),
             ("denied", {"status": "denied", "tool_name": "shell"}),
             ("expired", {"status": "expired", "tool_name": "shell"}),
@@ -1072,10 +1227,10 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(_json_size(msg), 4096)
         alert = msg["aps"]["alert"]
         self.assertTrue(alert["body"].startswith("Approval needed: "))
-        self.assertLessEqual(len(alert["body"].encode("utf-8")), MAX_TOOL_APPROVAL_BODY_BYTES)
+        self.assertLessEqual(len(alert["body"].encode("utf-8")), _MAX_TOOL_APPROVAL_BODY_BYTES)
         self.assertLessEqual(len(alert["title"].encode("utf-8")), MAX_ALERT_TITLE_BYTES)
-        self.assertLessEqual(len(alert["subtitle"].encode("utf-8")), MAX_ALERT_SUBTITLE_BYTES)
-        self.assertLessEqual(len(msg["sender"].encode("utf-8")), MAX_SENDER_BYTES)
+        self.assertLessEqual(len(alert["subtitle"].encode("utf-8")), _MAX_ALERT_SUBTITLE_BYTES)
+        self.assertLessEqual(len(msg["sender"].encode("utf-8")), _MAX_SENDER_BYTES)
         self.assertLessEqual(len(msg["room_name"].encode("utf-8")), MAX_ROOM_NAME_BYTES)
         self.assertEqual(msg[PLAIN_PAYLOAD_KEY], 1)
         self.assertEqual(msg["aps"]["mutable-content"], 1)
@@ -1094,11 +1249,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 assert want is not None and got is not None
                 self.assertLessEqual(_json_size(got), 4096)
                 got_alert = got["aps"]["alert"]
-                stage = (
-                    "stock"
-                    if "loc-key" in got_alert
-                    else ("rich" if "room_name" in got else "reduced")
-                )
+                stage = "stock" if "loc-key" in got_alert else ("rich" if "room_name" in got else "reduced")
                 self.assertEqual(stage, expected_stage)
                 if stage != "stock":
                     self.assertTrue(got_alert["body"].startswith("Approval needed: "))
@@ -1108,7 +1259,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             (
                 "encrypted_room",
                 _raw(
-                    event_type=ENCRYPTED_EVENT_TYPE,
+                    event_type=_ENCRYPTED_EVENT_TYPE,
                     room_name="Secret Room",
                     content={"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque"},
                 ),
@@ -1181,7 +1332,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             (
                 "encrypted_with_huge_names",
                 _raw(
-                    event_type=ENCRYPTED_EVENT_TYPE,
+                    event_type=_ENCRYPTED_EVENT_TYPE,
                     sender=big_sender_id,
                     sender_display_name=big_sender_name,
                     room_name=big_room_name,
@@ -1199,7 +1350,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 encoded = json.dumps(msg, ensure_ascii=False).encode("utf-8")
                 self.assertLessEqual(len(encoded), 4096)
                 self.assertLessEqual(len(msg["aps"]["thread-id"].encode("utf-8")), MAX_THREAD_ID_BYTES)
-                self.assertLessEqual(len(msg["sender"].encode("utf-8")), MAX_SENDER_BYTES)
+                self.assertLessEqual(len(msg["sender"].encode("utf-8")), _MAX_SENDER_BYTES)
                 self.assertLessEqual(
                     len(msg["sender_display_name"].encode("utf-8")),
                     MAX_SENDER_DISPLAY_NAME_BYTES,
@@ -1209,7 +1360,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 if "title" in alert:
                     self.assertLessEqual(len(alert["title"].encode("utf-8")), MAX_ALERT_TITLE_BYTES)
                 if "subtitle" in alert:
-                    self.assertLessEqual(len(alert["subtitle"].encode("utf-8")), MAX_ALERT_SUBTITLE_BYTES)
+                    self.assertLessEqual(len(alert["subtitle"].encode("utf-8")), _MAX_ALERT_SUBTITLE_BYTES)
 
     async def test_large_default_payload_and_control_char_names_never_regress(self) -> None:
         # 1. Large default_payload.custom_data (3500B & 3850B) must never raise BodyTooLongException
@@ -1317,21 +1468,21 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_reserved_fields_sanitized_on_every_event_alert(self) -> None:
         # (label, event type, content, extra _raw kwargs, alert kind), where the kind is
         # "structured" (stripped title/body alert), "stripped_emote" or "localized".
-        events: List[Tuple[str, str, Optional[Dict[str, Any]], Dict[str, Any], str]] = [
+        events: list[tuple[str, str, dict[str, Any] | None, dict[str, Any], str]] = [
             ("text", "m.room.message", {"msgtype": "m.text", "body": "**Hello**"}, {}, "structured"),
             ("notice", "m.room.message", {"msgtype": "m.notice", "body": "**Hello**"}, {}, "structured"),
             ("text_empty_after_strip", "m.room.message", {"msgtype": "m.text", "body": "---"}, {}, "localized"),
             ("emote", "m.room.message", {"msgtype": "m.emote", "body": "**waves**"}, {}, "stripped_emote"),
             ("emote_empty_after_strip", "m.room.message", {"msgtype": "m.emote", "body": "---"}, {}, "localized"),
             ("image", "m.room.message", {"msgtype": "m.image", "body": "sunset.jpg"}, {}, "localized"),
-            ("encrypted", ENCRYPTED_EVENT_TYPE, {"algorithm": "m.megolm.v1.aes-sha2"}, {}, "localized"),
+            ("encrypted", _ENCRYPTED_EVENT_TYPE, {"algorithm": "m.megolm.v1.aes-sha2"}, {}, "localized"),
             ("invite", "m.room.member", None, {"user_is_target": True, "membership": "invite"}, "localized"),
             ("legacy_call_invite", "m.call.invite", {"offer": {"sdp": "v=0\r\nm=audio 9\r\n"}}, {}, "localized"),
             ("unknown_type", "com.example.custom", {"x": 1}, {}, "localized"),
         ]
-        identities: List[Tuple[str, Dict[str, Any]]] = [
+        identities: list[tuple[str, dict[str, Any]]] = [
             ("present", REAL_IDENTITY),
-            ("absent", {key: None for key in REAL_IDENTITY}),
+            ("absent", dict.fromkeys(REAL_IDENTITY)),
         ]
         for label, event_type, content, extra, kind in events:
             for identity_label, identity in identities:
@@ -1376,7 +1527,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             "room_id": "!spoof:evil.example",
             "aps": {"alert": {"body": "Spoofed body"}},
         }
-        events: List[Tuple[str, str, Dict[str, Any], Dict[str, Any]]] = [
+        events: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = [
             (
                 "image",
                 "m.room.message",
@@ -1385,7 +1536,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             ),
             (
                 "encrypted",
-                ENCRYPTED_EVENT_TYPE,
+                _ENCRYPTED_EVENT_TYPE,
                 {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "opaque"},
                 {"loc-key": "MSG_FROM_USER_IN_ROOM", "loc-args": ["Alice", "Photos"]},
             ),
@@ -1439,9 +1590,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         want = await self._send(raw, stock=True)
         got = await self._send(raw)
         assert want is not None and got is not None
-        self.assertEqual(
-            want["aps"]["alert"]["loc-args"], ["Alice", "Engineering Room", "**hello**"]
-        )
+        self.assertEqual(want["aps"]["alert"]["loc-args"], ["Alice", "Engineering Room", "**hello**"])
         # The gateway metadata does not fit next to the whole preview, so the push
         # degrades to the stock payload instead of truncating the preview to "".
         self.assertEqual(got, want)
@@ -1454,7 +1603,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         for room_id in (REAL_IDENTITY["room_id"], None):
             with self.subTest(room_id=room_id):
 
-                def _spoofed_raw(pad: int, room_id: Optional[str] = room_id) -> Dict[str, Any]:
+                def _spoofed_raw(pad: int, room_id: str | None = room_id) -> dict[str, Any]:
                     return _raw(
                         event_type="m.room.message",
                         content={"msgtype": "m.text", "body": "**Hello**"},
@@ -1462,7 +1611,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                         **{**REAL_IDENTITY, "sender": long_sender, "room_id": room_id},
                     )
 
-                def _expected(raw: Dict[str, Any], room_id: Optional[str] = room_id) -> Dict[str, Any]:
+                def _expected(raw: dict[str, Any], room_id: str | None = room_id) -> dict[str, Any]:
                     return _without_reserved_fields(
                         self._stock_payload(raw), homeserver_sent_room_id=room_id is not None
                     )
@@ -1551,9 +1700,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                         preview = alert["loc-args"][2]
                         if want is not None:
                             # Never less preview than stock would have delivered.
-                            self.assertTrue(
-                                preview.startswith(want["aps"]["alert"]["loc-args"][2])
-                            )
+                            self.assertTrue(preview.startswith(want["aps"]["alert"]["loc-args"][2]))
                     stages_seen.add((payload_label, body_label, stage))
         self.assertEqual(
             stages_seen,
@@ -1573,13 +1720,11 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
 
         accepted = rejected = 0
         for _ in range(400):
-            alert: Dict[str, Any] = {"title": _text(40)}
+            alert: dict[str, Any] = {"title": _text(40)}
             if rng.random() < 0.5:
                 alert["body"] = _text(400)
             if "body" not in alert or rng.random() < 0.6:
-                alert["loc-args"] = [
-                    _text(rng.choice([5, 60, 400])) for _ in range(rng.randint(1, 3))
-                ]
+                alert["loc-args"] = [_text(rng.choice([5, 60, 400])) for _ in range(rng.randint(1, 3))]
             payload = {"aps": {"alert": alert, "badge": 1}, "pad": "x" * rng.randint(3300, 4100)}
             if not self.pushkin._fits_with_preview(payload):
                 rejected += 1
@@ -1651,9 +1796,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
         for label, raw in cases:
             with self.subTest(case=label):
                 want = await self._send(raw, stock=True)
-                with patch.object(
-                    apnstruncate, "truncate", wraps=apnstruncate.truncate
-                ) as truncate_spy:
+                with patch.object(apnstruncate, "truncate", wraps=apnstruncate.truncate) as truncate_spy:
                     msg = await self._send(raw)
                 self.assertEqual(truncate_spy.call_count, 1)
                 assert msg is not None and want is not None
@@ -1669,7 +1812,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_lone_surrogates_never_drop_a_push(self) -> None:
         bad = "\ud83d"
         # (label, broken _raw kwargs, metadata key that must carry the replacement character)
-        broken_fields: List[Tuple[str, Dict[str, Any], str]] = [
+        broken_fields: list[tuple[str, dict[str, Any], str]] = [
             ("sender", {"sender": f"@al{bad}ice:example.com"}, "sender"),
             (
                 "sender_without_display_name",
@@ -1680,12 +1823,15 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
             ("room_name", {"room_name": f"Eng{bad}ineering"}, "room_name"),
             ("room_alias", {"room_alias": f"#eng{bad}:example.com"}, "room_name"),
         ]
-        events: List[Tuple[str, Dict[str, Any]]] = [
+        events: list[tuple[str, dict[str, Any]]] = [
             ("text", {"event_type": "m.room.message", "content": {"msgtype": "m.text", "body": "**Hello**"}}),
-            ("text_broken_body", {"event_type": "m.room.message", "content": {"msgtype": "m.text", "body": f"He{bad}llo"}}),
+            (
+                "text_broken_body",
+                {"event_type": "m.room.message", "content": {"msgtype": "m.text", "body": f"He{bad}llo"}},
+            ),
             ("emote", {"event_type": "m.room.message", "content": {"msgtype": "m.emote", "body": f"wa{bad}ves"}}),
             ("image", {"event_type": "m.room.message", "content": {"msgtype": "m.image", "body": f"sun{bad}set.jpg"}}),
-            ("encrypted", {"event_type": ENCRYPTED_EVENT_TYPE, "content": {"algorithm": "m.megolm.v1.aes-sha2"}}),
+            ("encrypted", {"event_type": _ENCRYPTED_EVENT_TYPE, "content": {"algorithm": "m.megolm.v1.aes-sha2"}}),
             ("invite", {"event_type": "m.room.member", "user_is_target": True, "membership": "invite"}),
             ("legacy_call_invite", {"event_type": "m.call.invite", "content": {}}),
             ("ring", {"content": _ring(self.now_ms), "tweaks": {"sound": "ring"}}),
@@ -1741,7 +1887,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 self.sent[APP_ID].clear()
                 attempts = 0
 
-                def _handler(req: NotificationRequest, ok_at: Optional[int] = succeed_on) -> NotificationResult:
+                def _handler(req: NotificationRequest, ok_at: int | None = succeed_on) -> NotificationResult:
                     nonlocal attempts
                     attempts += 1
                     if ok_at is not None and attempts >= ok_at:
@@ -1769,6 +1915,7 @@ class MindroomApnsPushkinTestCase(unittest.IsolatedAsyncioTestCase):
                 if name == "mindroom_pushkin":
                     raise exc
                 return real_import(name, *args, **kwargs)
+
             return _imp
 
         # 2. ImportError / SyntaxError on pushkin import -> falls back to stock ApnsPushkin

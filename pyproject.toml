@@ -1,0 +1,52 @@
+[project]
+name = "mindroom-sygnal"
+version = "0.1.0"
+description = "Sygnal v0.17.0 APNs and FCM pushkin add-ons for MindRoom"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+  "privata>=0.8",
+  "ruff>=0.15.11",
+  "tach>=0.34.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "A",
+  "ASYNC",
+  "B",
+  "C4",
+  "E",
+  "F",
+  "G",
+  "I",
+  "LOG",
+  "PIE",
+  "RUF",
+  "SIM",
+  "T10",
+  "TC",
+  "TID",
+  "UP",
+  "W",
+]
+ignore = [
+  "B905",  # `zip()` without an explicit `strict=` parameter
+  "E501",  # Line too long (enforced by ruff format)
+  "UP047", # PEP 695 type-parameter migration
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+  "mindroom_fcm_pushkin",
+  "mindroom_pushkin",
+  "mindroom_pushkin_loader",
+]

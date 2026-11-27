@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright 2026 MindRoom contributors
 #
 # SPDX-License-Identifier: AGPL-3.0-only
@@ -18,7 +17,7 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Type, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from sygnal.apnspushkin import ApnsPushkin
 from sygnal.gcmpushkin import GcmPushkin
@@ -33,10 +32,10 @@ _PushkinT = TypeVar("_PushkinT", ApnsPushkin, GcmPushkin)
 async def _load_pushkin(
     module_name: str,
     attr: str,
-    base_cls: Type[_PushkinT],
+    base_cls: type[_PushkinT],
     name: str,
     sygnal: "Sygnal",
-    config: Dict[str, Any],
+    config: dict[str, Any],
 ) -> _PushkinT:
     try:
         mod = importlib.import_module(module_name)
@@ -58,21 +57,13 @@ class SafeApnsPushkin:
     """Factory for MindroomApnsPushkin that falls back to stock ApnsPushkin."""
 
     @classmethod
-    async def create(
-        cls, name: str, sygnal: "Sygnal", config: Dict[str, Any]
-    ) -> ApnsPushkin:
-        return await _load_pushkin(
-            "mindroom_pushkin", "MindroomApnsPushkin", ApnsPushkin, name, sygnal, config
-        )
+    async def create(cls, name: str, sygnal: "Sygnal", config: dict[str, Any]) -> ApnsPushkin:
+        return await _load_pushkin("mindroom_pushkin", "MindroomApnsPushkin", ApnsPushkin, name, sygnal, config)
 
 
 class SafeFcmPushkin:
     """Factory for MindroomFcmPushkin that falls back to stock GcmPushkin."""
 
     @classmethod
-    async def create(
-        cls, name: str, sygnal: "Sygnal", config: Dict[str, Any]
-    ) -> GcmPushkin:
-        return await _load_pushkin(
-            "mindroom_fcm_pushkin", "MindroomFcmPushkin", GcmPushkin, name, sygnal, config
-        )
+    async def create(cls, name: str, sygnal: "Sygnal", config: dict[str, Any]) -> GcmPushkin:
+        return await _load_pushkin("mindroom_fcm_pushkin", "MindroomFcmPushkin", GcmPushkin, name, sygnal, config)
