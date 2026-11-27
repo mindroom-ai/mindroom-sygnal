@@ -20,6 +20,12 @@ let
   apnsEnvFile = lib.escapeShellArg (toString cfg.apns.envFile);
   fcmServiceAccountFile = lib.escapeShellArg (toString cfg.fcm.serviceAccountFile);
 
+  formattedListenAddress =
+    if lib.hasInfix ":" cfg.listenAddress && !(lib.hasPrefix "[" cfg.listenAddress) then
+      "[${cfg.listenAddress}]"
+    else
+      cfg.listenAddress;
+
   appLines =
     lib.optionals cfg.apns.enable [
       "  ${builtins.toJSON cfg.apns.appId}:"
@@ -97,10 +103,13 @@ let
       "[ -s ${apnsKeyFile} ]"
       ''! ${pkgs.gnugrep}/bin/grep -q "CHANGE_ME" ${apnsKeyFile}''
     ]
-    ++ lib.optionals useApnsEnvFile [
-      ''${pkgs.gnugrep}/bin/grep -q "^SYGNAL_APNS_KEY_ID=" ${apnsEnvFile}''
-      ''! ${pkgs.gnugrep}/bin/grep -q "CHANGE_ME" ${apnsEnvFile}''
-    ]
+    ++ lib.optionals useApnsEnvFile (
+      [ "[ -s ${apnsEnvFile} ]" ]
+      ++ lib.optional (
+        cfg.apns.keyId == "$SYGNAL_APNS_KEY_ID"
+      ) ''${pkgs.gnugrep}/bin/grep -q "^SYGNAL_APNS_KEY_ID=" ${apnsEnvFile}''
+      ++ [ ''! ${pkgs.gnugrep}/bin/grep -q "CHANGE_ME" ${apnsEnvFile}'' ]
+    )
     ++ lib.optionals cfg.fcm.enable [
       "[ -s ${fcmServiceAccountFile} ]"
       ''! ${pkgs.gnugrep}/bin/grep -q "CHANGE_ME" ${fcmServiceAccountFile}''
@@ -198,7 +207,7 @@ in
 
     virtualisation.podman.enable = true;
     virtualisation.oci-containers.backend = "podman";
-    systemd.tmpfiles.rules = [ "d /run/sygnal 0750 root root -" ];
+    systemd.tmpfiles.rules = [ "d /run/mindroom-sygnal 0750 root root -" ];
 
     systemd.services.sygnal-setup = {
       description = "Prepare Sygnal runtime configuration";
@@ -209,19 +218,19 @@ in
         RemainAfterExit = true;
       };
       script = ''
-        install -d -m 0750 /run/sygnal
-        rm -f /run/sygnal/mindroom_*.py
+        install -d -m 0750 /run/mindroom-sygnal
+        rm -f /run/mindroom-sygnal/mindroom_*.py /run/sygnal/mindroom_*.py
         ${
           if cfg.apns.enable then
-            "install -m 0400 ${apnsKeyFile} /run/sygnal/sygnal-apns-key.p8"
+            "install -m 0400 ${apnsKeyFile} /run/mindroom-sygnal/sygnal-apns-key.p8"
           else
-            "rm -f /run/sygnal/sygnal-apns-key.p8"
+            "rm -f /run/mindroom-sygnal/sygnal-apns-key.p8"
         }
         ${
           if cfg.fcm.enable then
-            "install -m 0400 ${fcmServiceAccountFile} /run/sygnal/sygnal-fcm-service-account.json"
+            "install -m 0400 ${fcmServiceAccountFile} /run/mindroom-sygnal/sygnal-fcm-service-account.json"
           else
-            "rm -f /run/sygnal/sygnal-fcm-service-account.json"
+            "rm -f /run/mindroom-sygnal/sygnal-fcm-service-account.json"
         }
         ${
           if useApnsEnvFile then
@@ -231,12 +240,12 @@ in
                 set -a
                 . ${apnsEnvFile}
                 set +a
-                rm -f /run/sygnal/sygnal.yaml
-                ${pkgs.envsubst}/bin/envsubst -o /run/sygnal/sygnal.yaml -i ${sygnalConfigTemplate}
+                rm -f /run/mindroom-sygnal/sygnal.yaml
+                ${pkgs.envsubst}/bin/envsubst -o /run/mindroom-sygnal/sygnal.yaml -i ${sygnalConfigTemplate}
               )
-              chmod 0400 /run/sygnal/sygnal.yaml''
+              chmod 0400 /run/mindroom-sygnal/sygnal.yaml''
           else
-            "install -m 0400 ${sygnalConfigTemplate} /run/sygnal/sygnal.yaml"
+            "install -m 0400 ${sygnalConfigTemplate} /run/mindroom-sygnal/sygnal.yaml"
         }
       '';
     };
@@ -250,9 +259,9 @@ in
         PYTHONPATH = "/sygnal-addons";
         SYGNAL_CONF = "/sygnal/sygnal.yaml";
       };
-      ports = [ "${cfg.listenAddress}:${toString cfg.port}:5000" ];
+      ports = [ "${formattedListenAddress}:${toString cfg.port}:5000" ];
       volumes = [
-        "/run/sygnal:/sygnal:ro"
+        "/run/mindroom-sygnal:/sygnal:ro"
         "${cfg.package}:/sygnal-addons:ro"
       ];
     };

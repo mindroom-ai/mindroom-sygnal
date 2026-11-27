@@ -13,29 +13,35 @@
         "aarch64-darwin"
         "x86_64-darwin"
       ];
-      forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       nixosModule = import ./nixos-module.nix { inherit self; };
     in
     {
-      packages = forAllSystems (pkgs: {
-        default = pkgs.runCommandLocal "mindroom-sygnal" { } ''
-          mkdir -p "$out"
-          cp ${./mindroom_pushkin.py} "$out/mindroom_pushkin.py"
-          cp ${./mindroom_fcm_pushkin.py} "$out/mindroom_fcm_pushkin.py"
-          cp ${./mindroom_pushkin_loader.py} "$out/mindroom_pushkin_loader.py"
-        '';
-      });
+      packages = lib.genAttrs systems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.runCommandLocal "mindroom-sygnal" { } ''
+            mkdir -p "$out"
+            cp ${./mindroom_pushkin.py} "$out/mindroom_pushkin.py"
+            cp ${./mindroom_fcm_pushkin.py} "$out/mindroom_fcm_pushkin.py"
+            cp ${./mindroom_pushkin_loader.py} "$out/mindroom_pushkin_loader.py"
+          '';
+        }
+      );
 
       nixosModules = {
         default = nixosModule;
         mindroom-sygnal = nixosModule;
       };
 
-      checks = forAllSystems (
-        pkgs:
+      checks = lib.genAttrs systems (
+        system:
         let
-          pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          pkgs = nixpkgs.legacyPackages.${system};
+          pkg = self.packages.${system}.default;
         in
         {
           package-contents = pkgs.runCommandLocal "check-mindroom-sygnal" { } ''
@@ -63,179 +69,197 @@
             touch "$out"
           '';
         }
-        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
-          let
-            evalNixosModule =
-              module: moduleConfig:
-              lib.nixosSystem {
-                modules = [
-                  {
-                    nixpkgs.pkgs = pkgs;
-                    system.stateVersion = lib.trivial.release;
-                    fileSystems."/" = {
-                      device = "/dev/null";
-                      fsType = "ext4";
-                    };
-                    boot.loader.grub.enable = false;
-                  }
-                  module
-                  moduleConfig
-                ];
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          nixos-module =
+            let
+              evalNixosModule =
+                module: moduleConfig:
+                lib.nixosSystem {
+                  modules = [
+                    {
+                      nixpkgs.pkgs = pkgs;
+                      system.stateVersion = lib.trivial.release;
+                      fileSystems."/" = {
+                        device = "/dev/null";
+                        fsType = "ext4";
+                      };
+                      boot.loader.grub.enable = false;
+                    }
+                    module
+                    moduleConfig
+                  ];
+                };
+
+              failedMessages =
+                eval: map (a: a.message) (builtins.filter (a: !a.assertion) eval.config.assertions);
+
+              inspectEval =
+                eval:
+                let
+                  cfg = eval.config;
+                  sygnalSetup = cfg.systemd.services.sygnal-setup;
+                  podmanSygnal = cfg.systemd.services.podman-sygnal;
+                  container = cfg.virtualisation.oci-containers.containers.sygnal;
+                in
+                {
+                  failedAssertions = failedMessages eval;
+                  podmanEnabled = cfg.virtualisation.podman.enable;
+                  ociBackend = cfg.virtualisation.oci-containers.backend;
+                  tmpfilesRules = cfg.systemd.tmpfiles.rules;
+                  hasPodmanPkg = builtins.any (p: (p.pname or "") == "podman") cfg.environment.systemPackages;
+                  container = {
+                    inherit (container)
+                      image
+                      autoStart
+                      environment
+                      ports
+                      volumes
+                      ;
+                  };
+                  setup = {
+                    inherit (sygnalSetup) before script;
+                    serviceType = sygnalSetup.serviceConfig.Type;
+                    remainAfterExit = sygnalSetup.serviceConfig.RemainAfterExit;
+                    restartTriggers = map toString sygnalSetup.restartTriggers;
+                    templatePath = builtins.head sygnalSetup.restartTriggers;
+                  };
+                  podmanService = {
+                    inherit (podmanSygnal) after requires wants;
+                    restartTriggers = map toString podmanSygnal.restartTriggers;
+                    execCondition = podmanSygnal.serviceConfig.ExecCondition;
+                  };
+                };
+
+              apnsAndFcm = evalNixosModule self.nixosModules.default {
+                services.mindroom-sygnal = {
+                  enable = true;
+                  extraRestartTriggers = [
+                    ./flake.nix
+                    "secret-trigger"
+                  ];
+                  apns = {
+                    enable = true;
+                    appId = "chat.mindroom.app";
+                    keyFile = "/run/agenix/sygnal-apns-key";
+                    envFile = "/run/agenix/sygnal-env";
+                  };
+                  fcm = {
+                    enable = true;
+                    appId = "com.mindroom_ai.app";
+                    projectId = "mindroom-prod";
+                    serviceAccountFile = "/run/agenix/sygnal-fcm-service-account";
+                  };
+                };
               };
 
-            failedMessages =
-              eval: map (a: a.message) (builtins.filter (a: !a.assertion) eval.config.assertions);
-
-            inspectEval =
-              eval:
-              let
-                cfg = eval.config;
-                sygnalSetup = cfg.systemd.services.sygnal-setup;
-                podmanSygnal = cfg.systemd.services.podman-sygnal;
-                container = cfg.virtualisation.oci-containers.containers.sygnal;
-              in
-              {
-                failedAssertions = failedMessages eval;
-                podmanEnabled = cfg.virtualisation.podman.enable;
-                ociBackend = cfg.virtualisation.oci-containers.backend;
-                tmpfilesRules = cfg.systemd.tmpfiles.rules;
-                hasPodmanPkg = builtins.any (p: (p.pname or "") == "podman") cfg.environment.systemPackages;
-                container = {
-                  inherit (container)
-                    image
-                    autoStart
-                    environment
-                    ports
-                    volumes
-                    ;
-                };
-                setup = {
-                  inherit (sygnalSetup) before script;
-                  serviceType = sygnalSetup.serviceConfig.Type;
-                  remainAfterExit = sygnalSetup.serviceConfig.RemainAfterExit;
-                  restartTriggers = map toString sygnalSetup.restartTriggers;
-                  templatePath = builtins.head sygnalSetup.restartTriggers;
-                };
-                podmanService = {
-                  inherit (podmanSygnal) after requires wants;
-                  restartTriggers = map toString podmanSygnal.restartTriggers;
-                  execCondition = podmanSygnal.serviceConfig.ExecCondition;
+              apnsOnly = evalNixosModule self.nixosModules.mindroom-sygnal {
+                services.mindroom-sygnal = {
+                  enable = true;
+                  listenAddress = "127.0.0.2";
+                  port = 5500;
+                  logLevel = "DEBUG";
+                  xForwardedFor = false;
+                  apns = {
+                    enable = true;
+                    appId = "chat.mindroom.app";
+                    keyFile = "/run/secrets/apns key.p8";
+                    keyId = "ABC1234567";
+                    teamId = "DEF8901234";
+                    topic = "chat.mindroom.app";
+                    platform = "production";
+                    convertDeviceTokenToHex = true;
+                  };
                 };
               };
 
-            apnsAndFcm = evalNixosModule self.nixosModules.default {
-              services.mindroom-sygnal = {
-                enable = true;
-                extraRestartTriggers = [
-                  ./flake.nix
-                  "secret-trigger"
-                ];
-                apns = {
+              apnsMixedLiteralKeyId = evalNixosModule self.nixosModules.default {
+                services.mindroom-sygnal = {
                   enable = true;
-                  appId = "chat.mindroom.app";
-                  keyFile = "/run/agenix/sygnal-apns-key";
-                  envFile = "/run/agenix/sygnal-env";
-                };
-                fcm = {
-                  enable = true;
-                  appId = "com.mindroom_ai.app";
-                  projectId = "mindroom-prod";
-                  serviceAccountFile = "/run/agenix/sygnal-fcm-service-account";
+                  listenAddress = "[::1]";
+                  apns = {
+                    enable = true;
+                    appId = "chat.mindroom.app";
+                    keyFile = "/run/secrets/apns.p8";
+                    envFile = "/run/secrets/sygnal-env";
+                    keyId = "LITERALKEY1";
+                  };
                 };
               };
-            };
 
-            apnsOnly = evalNixosModule self.nixosModules.mindroom-sygnal {
-              services.mindroom-sygnal = {
-                enable = true;
-                listenAddress = "127.0.0.2";
-                port = 5500;
-                logLevel = "DEBUG";
-                xForwardedFor = false;
-                apns = {
+              fcmOnly = evalNixosModule self.nixosModules.default {
+                services.mindroom-sygnal = {
                   enable = true;
-                  appId = "chat.mindroom.app";
-                  keyFile = "/run/secrets/apns key.p8";
-                  keyId = "ABC1234567";
-                  teamId = "DEF8901234";
-                  topic = "chat.mindroom.app";
-                  platform = "production";
-                  convertDeviceTokenToHex = true;
+                  listenAddress = "::1";
+                  fcm = {
+                    enable = true;
+                    appId = "com.mindroom_ai.app";
+                    projectId = "mindroom-android";
+                    serviceAccountFile = "/run/secrets/fcm-sa.json";
+                  };
                 };
               };
-            };
 
-            fcmOnly = evalNixosModule self.nixosModules.default {
-              services.mindroom-sygnal = {
-                enable = true;
-                fcm = {
+              disabled = evalNixosModule self.nixosModules.default { };
+
+              noPlatforms = evalNixosModule self.nixosModules.default {
+                services.mindroom-sygnal.enable = true;
+              };
+
+              duplicateAppId = evalNixosModule self.nixosModules.default {
+                services.mindroom-sygnal = {
                   enable = true;
-                  appId = "com.mindroom_ai.app";
-                  projectId = "mindroom-android";
-                  serviceAccountFile = "/run/secrets/fcm-sa.json";
+                  apns = {
+                    enable = true;
+                    appId = "same.app.id";
+                    keyFile = "/run/secrets/apns.p8";
+                    envFile = "/run/secrets/sygnal-env";
+                  };
+                  fcm = {
+                    enable = true;
+                    appId = "same.app.id";
+                    projectId = "mindroom-prod";
+                    serviceAccountFile = "/run/secrets/fcm.json";
+                  };
                 };
               };
-            };
 
-            disabled = evalNixosModule self.nixosModules.default { };
-
-            noPlatforms = evalNixosModule self.nixosModules.default {
-              services.mindroom-sygnal.enable = true;
-            };
-
-            duplicateAppId = evalNixosModule self.nixosModules.default {
-              services.mindroom-sygnal = {
-                enable = true;
-                apns = {
+              apnsPlaceholdersNoEnv = evalNixosModule self.nixosModules.default {
+                services.mindroom-sygnal = {
                   enable = true;
-                  appId = "same.app.id";
-                  keyFile = "/run/secrets/apns.p8";
-                  envFile = "/run/secrets/sygnal-env";
-                };
-                fcm = {
-                  enable = true;
-                  appId = "same.app.id";
-                  projectId = "mindroom-prod";
-                  serviceAccountFile = "/run/secrets/fcm.json";
+                  apns = {
+                    enable = true;
+                    appId = "chat.mindroom.app";
+                    keyFile = "/run/secrets/apns.p8";
+                  };
                 };
               };
-            };
 
-            apnsPlaceholdersNoEnv = evalNixosModule self.nixosModules.default {
-              services.mindroom-sygnal = {
-                enable = true;
-                apns = {
-                  enable = true;
-                  appId = "chat.mindroom.app";
-                  keyFile = "/run/secrets/apns.p8";
-                };
-              };
-            };
+              testData = pkgs.writeText "nixos-module-check.json" (
+                builtins.toJSON {
+                  pkg = toString pkg;
+                  defaultImage = apnsAndFcm.options.services.mindroom-sygnal.image.default;
+                  ciWorkflow = "${./.github/workflows/ci.yml}";
+                  extraTriggerPath = toString ./flake.nix;
+                  apnsAndFcm = inspectEval apnsAndFcm;
+                  apnsOnly = inspectEval apnsOnly;
+                  apnsMixedLiteralKeyId = inspectEval apnsMixedLiteralKeyId;
+                  fcmOnly = inspectEval fcmOnly;
+                  disabledHasContainer = disabled.config.virtualisation.oci-containers.containers ? sygnal;
+                  disabledHasSetup = disabled.config.systemd.services ? sygnal-setup;
+                  failedAssertions = {
+                    noPlatforms = failedMessages noPlatforms;
+                    duplicateAppId = failedMessages duplicateAppId;
+                    apnsPlaceholdersNoEnv = failedMessages apnsPlaceholdersNoEnv;
+                  };
+                }
+              );
 
-            testData = pkgs.writeText "nixos-module-check.json" (
-              builtins.toJSON {
-                pkg = toString pkg;
-                defaultImage = apnsAndFcm.options.services.mindroom-sygnal.image.default;
-                ciWorkflow = "${./.github/workflows/ci.yml}";
-                extraTriggerPath = toString ./flake.nix;
-                apnsAndFcm = inspectEval apnsAndFcm;
-                apnsOnly = inspectEval apnsOnly;
-                fcmOnly = inspectEval fcmOnly;
-                disabledHasContainer = disabled.config.virtualisation.oci-containers.containers ? sygnal;
-                disabledHasSetup = disabled.config.systemd.services ? sygnal-setup;
-                failedAssertions = {
-                  noPlatforms = failedMessages noPlatforms;
-                  duplicateAppId = failedMessages duplicateAppId;
-                  apnsPlaceholdersNoEnv = failedMessages apnsPlaceholdersNoEnv;
-                };
-              }
-            );
-
-            python = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
-          in
-          {
-            nixos-module = pkgs.runCommandLocal "check-nixos-module" { } ''
-              ${python}/bin/python - ${testData} ${pkgs.bash}/bin/bash ${pkgs.envsubst}/bin/envsubst <<'PY'
+              python = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
+            in
+            pkgs.runCommandLocal "check-nixos-module" { } ''
+              test_tmp=$(mktemp -d "''${TMPDIR:-/tmp}/sygnal-check.XXXXXX")
+              trap 'rm -rf "$test_tmp"' EXIT
+              ${python}/bin/python - ${testData} ${pkgs.bash}/bin/bash ${pkgs.envsubst}/bin/envsubst "$test_tmp" <<'PY'
               import json
               import os
               import re
@@ -247,6 +271,7 @@
 
               data = json.loads(Path(sys.argv[1]).read_text())
               bash_bin, envsubst_bin = sys.argv[2], sys.argv[3]
+              test_tmp = Path(sys.argv[4])
               pkg = data["pkg"]
               default_image = data["defaultImage"]
 
@@ -270,7 +295,7 @@
                   assert item["failedAssertions"] == [], f"{name}: {item['failedAssertions']}"
                   assert item["podmanEnabled"] is True
                   assert item["ociBackend"] == "podman"
-                  assert "d /run/sygnal 0750 root root -" in item["tmpfilesRules"]
+                  assert "d /run/mindroom-sygnal 0750 root root -" in item["tmpfilesRules"]
                   assert item["hasPodmanPkg"] is True
 
                   c = item["container"]
@@ -283,7 +308,7 @@
                       "SYGNAL_CONF": "/sygnal/sygnal.yaml",
                   }
                   assert c["ports"] == [expected_port]
-                  assert c["volumes"] == ["/run/sygnal:/sygnal:ro", f"{pkg}:/sygnal-addons:ro"]
+                  assert c["volumes"] == ["/run/mindroom-sygnal:/sygnal:ro", f"{pkg}:/sygnal-addons:ro"]
 
                   setup = item["setup"]
                   assert "podman-sygnal.service" in setup["before"]
@@ -291,7 +316,8 @@
                   assert setup["remainAfterExit"] is True
                   assert pkg in setup["restartTriggers"]
                   assert setup["templatePath"] in setup["restartTriggers"]
-                  assert "rm -f /run/sygnal/mindroom_*.py" in setup["script"]
+                  assert "install -d -m 0750 /run/mindroom-sygnal" in setup["script"]
+                  assert "rm -f /run/mindroom-sygnal/mindroom_*.py /run/sygnal/mindroom_*.py" in setup["script"]
                   assert "mindroom_pushkin.py" not in setup["script"]
                   assert "mindroom_pushkin_loader.py" not in setup["script"]
                   assert "mindroom_fcm_pushkin.py" not in setup["script"]
@@ -320,13 +346,14 @@
               setup, cond, _, parsed = check_common("apnsAndFcm", data["apnsAndFcm"])
               assert data["extraTriggerPath"] in setup["restartTriggers"]
               assert "secret-trigger" in setup["restartTriggers"]
-              assert "install -m 0400 /run/agenix/sygnal-apns-key /run/sygnal/sygnal-apns-key.p8" in setup["script"]
-              assert "install -m 0400 /run/agenix/sygnal-fcm-service-account /run/sygnal/sygnal-fcm-service-account.json" in setup["script"]
+              assert "install -m 0400 /run/agenix/sygnal-apns-key /run/mindroom-sygnal/sygnal-apns-key.p8" in setup["script"]
+              assert "install -m 0400 /run/agenix/sygnal-fcm-service-account /run/mindroom-sygnal/sygnal-fcm-service-account.json" in setup["script"]
               assert ". /run/agenix/sygnal-env" in setup["script"]
-              assert f"-o /run/sygnal/sygnal.yaml -i {setup['templatePath']}" in setup["script"]
+              assert f"-o /run/mindroom-sygnal/sygnal.yaml -i {setup['templatePath']}" in setup["script"]
               assert "envsubst" in setup["script"]
               assert "[ -s /run/agenix/sygnal-apns-key ]" in cond
               assert 'grep -q "CHANGE_ME" /run/agenix/sygnal-apns-key' in cond
+              assert "[ -s /run/agenix/sygnal-env ]" in cond
               assert 'grep -q "^SYGNAL_APNS_KEY_ID=" /run/agenix/sygnal-env' in cond
               assert 'grep -q "CHANGE_ME" /run/agenix/sygnal-env' in cond
               assert "[ -s /run/agenix/sygnal-fcm-service-account ]" in cond
@@ -371,9 +398,9 @@
               assert isinstance(rendered_yaml["apps"]["chat.mindroom.app"]["key_id"], str)
               assert rendered_yaml["apps"]["chat.mindroom.app"]["platform"] == "production"
 
-              # Verify runtime ExecCondition behavior by pointing the generated script at temp files
-              secret_dir = Path("/tmp/sygnal-test")
-              secret_dir.mkdir(parents=True, exist_ok=True)
+              # Verify runtime ExecCondition behavior (APNs+FCM with envFile + $SYGNAL_APNS_KEY_ID)
+              secret_dir = test_tmp / "apns-fcm"
+              secret_dir.mkdir()
               cond_copy = secret_dir / "cond.sh"
               cond_copy.write_text(cond.replace("/run/agenix", str(secret_dir)))
               cond_copy.chmod(stat.S_IRWXU)
@@ -381,32 +408,34 @@
               env_file = secret_dir / "sygnal-env"
               fcm_file = secret_dir / "sygnal-fcm-service-account"
 
-              def run_cond():
-                  return subprocess.run([str(cond_copy)]).returncode
+              def run_cond(script):
+                  return subprocess.run([str(script)]).returncode
 
-              assert 1 <= run_cond() <= 254  # missing files
+              assert 1 <= run_cond(cond_copy) <= 254  # missing files
               apns_key.write_text("")
               env_file.write_text("SYGNAL_APNS_KEY_ID=ABC1234567\n")
               fcm_file.write_text('{"type": "service_account"}\n')
-              assert 1 <= run_cond() <= 254  # empty APNs key
+              assert 1 <= run_cond(cond_copy) <= 254  # empty APNs key
               apns_key.write_text("CHANGE_ME\n")
-              assert 1 <= run_cond() <= 254  # placeholder APNs key
+              assert 1 <= run_cond(cond_copy) <= 254  # placeholder APNs key
               apns_key.write_text("-----BEGIN PRIVATE KEY-----\n")
+              env_file.write_text("")
+              assert 1 <= run_cond(cond_copy) <= 254  # empty envFile
               env_file.write_text("OTHER=1\n")
-              assert 1 <= run_cond() <= 254  # missing SYGNAL_APNS_KEY_ID
+              assert 1 <= run_cond(cond_copy) <= 254  # missing SYGNAL_APNS_KEY_ID
               env_file.write_text("SYGNAL_APNS_KEY_ID=CHANGE_ME\n")
-              assert 1 <= run_cond() <= 254  # placeholder envFile
+              assert 1 <= run_cond(cond_copy) <= 254  # placeholder envFile
               env_file.write_text("SYGNAL_APNS_KEY_ID=ABC1234567\n")
               fcm_file.write_text('{"private_key": "CHANGE_ME"}\n')
-              assert 1 <= run_cond() <= 254  # placeholder FCM file
+              assert 1 <= run_cond(cond_copy) <= 254  # placeholder FCM file
               fcm_file.write_text('{"type": "service_account"}\n')
-              assert run_cond() == 0  # all valid
+              assert run_cond(cond_copy) == 0  # all valid
 
               # 2. APNs-only (no envFile, custom port/logLevel/xForwardedFor, path with space)
               setup, cond, _, parsed = check_common("apnsOnly", data["apnsOnly"], expected_port="127.0.0.2:5500:5000")
-              assert "install -m 0400 '/run/secrets/apns key.p8' /run/sygnal/sygnal-apns-key.p8" in setup["script"]
-              assert "rm -f /run/sygnal/sygnal-fcm-service-account.json" in setup["script"]
-              assert f"install -m 0400 {setup['templatePath']} /run/sygnal/sygnal.yaml" in setup["script"]
+              assert "install -m 0400 '/run/secrets/apns key.p8' /run/mindroom-sygnal/sygnal-apns-key.p8" in setup["script"]
+              assert "rm -f /run/mindroom-sygnal/sygnal-fcm-service-account.json" in setup["script"]
+              assert f"install -m 0400 {setup['templatePath']} /run/mindroom-sygnal/sygnal.yaml" in setup["script"]
               assert "envsubst" not in setup["script"]
               assert "[ -s '/run/secrets/apns key.p8' ]" in cond
               assert "SYGNAL_APNS_KEY_ID" not in cond
@@ -425,11 +454,37 @@
                   "convert_device_token_to_hex": True,
               }
 
-              # 3. FCM-only (no apns options set)
-              setup, cond, _, parsed = check_common("fcmOnly", data["fcmOnly"])
-              assert "rm -f /run/sygnal/sygnal-apns-key.p8" in setup["script"]
-              assert "install -m 0400 /run/secrets/fcm-sa.json /run/sygnal/sygnal-fcm-service-account.json" in setup["script"]
-              assert f"install -m 0400 {setup['templatePath']} /run/sygnal/sygnal.yaml" in setup["script"]
+              # 3. Mixed literal apns.keyId + apns.envFile (and pre-bracketed IPv6 listenAddress)
+              setup, cond, _, parsed = check_common(
+                  "apnsMixedLiteralKeyId",
+                  data["apnsMixedLiteralKeyId"],
+                  expected_port="[::1]:5000:5000",
+              )
+              assert "[ -s /run/secrets/sygnal-env ]" in cond
+              assert 'grep -q "CHANGE_ME" /run/secrets/sygnal-env' in cond
+              assert "SYGNAL_APNS_KEY_ID" not in cond
+              assert parsed["apps"]["chat.mindroom.app"]["key_id"] == "LITERALKEY1"
+              assert parsed["apps"]["chat.mindroom.app"]["team_id"] == "$SYGNAL_APNS_TEAM_ID"
+
+              mixed_dir = test_tmp / "apns-mixed"
+              mixed_dir.mkdir()
+              mixed_cond = mixed_dir / "cond.sh"
+              mixed_cond.write_text(cond.replace("/run/secrets", str(mixed_dir)))
+              mixed_cond.chmod(stat.S_IRWXU)
+              (mixed_dir / "apns.p8").write_text("-----BEGIN PRIVATE KEY-----\n")
+              assert 1 <= run_cond(mixed_cond) <= 254  # missing envFile
+              (mixed_dir / "sygnal-env").write_text("")
+              assert 1 <= run_cond(mixed_cond) <= 254  # empty envFile
+              (mixed_dir / "sygnal-env").write_text("SYGNAL_APNS_TEAM_ID=CHANGE_ME\n")
+              assert 1 <= run_cond(mixed_cond) <= 254  # placeholder envFile
+              (mixed_dir / "sygnal-env").write_text("SYGNAL_APNS_TEAM_ID=TEAM123456\n")
+              assert run_cond(mixed_cond) == 0  # passes without SYGNAL_APNS_KEY_ID
+
+              # 4. FCM-only (no apns options set, unbracketed IPv6 listenAddress ::1)
+              setup, cond, _, parsed = check_common("fcmOnly", data["fcmOnly"], expected_port="[::1]:5000:5000")
+              assert "rm -f /run/mindroom-sygnal/sygnal-apns-key.p8" in setup["script"]
+              assert "install -m 0400 /run/secrets/fcm-sa.json /run/mindroom-sygnal/sygnal-fcm-service-account.json" in setup["script"]
+              assert f"install -m 0400 {setup['templatePath']} /run/mindroom-sygnal/sygnal.yaml" in setup["script"]
               assert "envsubst" not in setup["script"]
               assert "[ -s /run/secrets/fcm-sa.json ]" in cond
               assert 'grep -q "CHANGE_ME" /run/secrets/fcm-sa.json' in cond
@@ -445,8 +500,7 @@
               PY
               touch "$out"
             '';
-          }
-        )
+        }
       );
     };
 }

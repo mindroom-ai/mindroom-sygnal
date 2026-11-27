@@ -55,7 +55,7 @@ apps:
 
 ## NixOS module
 
-The flake exports `nixosModules.default` (alias `nixosModules.mindroom-sygnal`), which runs the pinned Sygnal `v0.17.0` container via Podman, bind-mounts `packages.<system>.default` read-only at `/sygnal-addons` with `PYTHONPATH=/sygnal-addons`, stages runtime secrets and `sygnal.yaml` under `/run/sygnal` (`0400`), and skips startup cleanly until placeholder secrets (`CHANGE_ME`) are replaced.
+The flake exports `nixosModules.default` (alias `nixosModules.mindroom-sygnal`), which runs the pinned Sygnal `v0.17.0` container via Podman, bind-mounts `packages.<system>.default` read-only at `/sygnal-addons` with `PYTHONPATH=/sygnal-addons`, stages runtime secrets and `sygnal.yaml` under `/run/mindroom-sygnal` (`0400`), and skips startup cleanly until placeholder secrets (`CHANGE_ME`) are replaced.
 
 The module is secret-manager agnostic: pass runtime file paths (e.g. from agenix or sops-nix) and optionally wire ciphertext files into `extraRestartTriggers`:
 
