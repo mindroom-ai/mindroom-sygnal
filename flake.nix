@@ -1,5 +1,5 @@
 {
-  description = "Sygnal v0.17.0 APNs pushkin add-on for MindRoom rich iOS notifications and incoming-call rings";
+  description = "Sygnal v0.17.0 APNs and FCM pushkin add-ons for MindRoom rich notifications and incoming-call rings";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -20,6 +20,7 @@
         default = pkgs.runCommandLocal "mindroom-sygnal" { } ''
           mkdir -p "$out"
           cp ${./mindroom_pushkin.py} "$out/mindroom_pushkin.py"
+          cp ${./mindroom_fcm_pushkin.py} "$out/mindroom_fcm_pushkin.py"
           cp ${./mindroom_pushkin_loader.py} "$out/mindroom_pushkin_loader.py"
         '';
       });
@@ -28,8 +29,10 @@
         package-contents = pkgs.runCommandLocal "check-mindroom-sygnal" { } ''
           pkg=${self.packages.${pkgs.stdenv.hostPlatform.system}.default}
           test -f "$pkg/mindroom_pushkin.py"
+          test -f "$pkg/mindroom_fcm_pushkin.py"
           test -f "$pkg/mindroom_pushkin_loader.py"
           test ! -e "$pkg/test_mindroom_pushkin.py"
+          test ! -e "$pkg/test_mindroom_fcm_pushkin.py"
           touch "$out"
         '';
       });

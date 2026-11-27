@@ -443,6 +443,31 @@ def ring_of(n: Notification, now: int) -> Optional[Dict[str, Any]]:
     return ring
 
 
+def _ring_expires_at(ring: Dict[str, Any]) -> int:
+    """Return the capped wall-clock expiry timestamp in ms for a validated ring."""
+    return ring["sender_ts"] + min(ring["lifetime"], MAX_RING_LIFETIME_MS)
+
+
+def _extract_display_fields(
+    n: Notification,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return ``(sender_display_name, sender_id, room_display)``."""
+    return (
+        _clean_display_field(n.sender_display_name),
+        n.sender if isinstance(n.sender, str) and n.sender else None,
+        _clean_display_field(n.room_name) or _clean_display_field(n.room_alias),
+    )
+
+
+def _format_tool_approval_body(content: Dict[str, Any]) -> str:
+    """Format a pending tool-approval summary line."""
+    tool_name = _clean_display_field(content.get("tool_name"))
+    return _truncate_utf8(
+        f"Approval needed: {tool_name}" if tool_name else "Approval needed",
+        MAX_TOOL_APPROVAL_BODY_BYTES,
+    )
+
+
 class MindroomApnsPushkin(ApnsPushkin):
     """Sygnal v0.17.0 ApnsPushkin subclass adding rich alerts and call-ring alerts.
 
@@ -548,13 +573,8 @@ class MindroomApnsPushkin(ApnsPushkin):
         aps: Dict[str, Any],
     ) -> None:
         """Enrich a non-ring alert-bearing APNs payload for rich iOS rendering."""
-        sender_display_name = _clean_display_field(n.sender_display_name)
-        sender_id = n.sender if isinstance(n.sender, str) and n.sender else None
+        sender_display_name, sender_id, room_display = _extract_display_fields(n)
         from_display = sender_display_name or sender_id or " "
-
-        room_display = _clean_display_field(n.room_name) or _clean_display_field(
-            n.room_alias
-        )
 
         content = n.content if isinstance(n.content, dict) else None
         if n.type == "m.room.message" and content is not None:
@@ -589,11 +609,7 @@ class MindroomApnsPushkin(ApnsPushkin):
                         from_display, room_display
                     )
         elif n.type == TOOL_APPROVAL_TYPE and content is not None:
-            tool_name = _clean_display_field(content.get("tool_name"))
-            approval_body = _truncate_utf8(
-                f"Approval needed: {tool_name}" if tool_name else "Approval needed",
-                MAX_TOOL_APPROVAL_BODY_BYTES,
-            )
+            approval_body = _format_tool_approval_body(content)
             aps["alert"] = self._structured_alert(
                 from_display, room_display, approval_body
             )
@@ -636,7 +652,7 @@ class MindroomApnsPushkin(ApnsPushkin):
         now = now_ms()
         ring = ring_of(n, now) if device.tweaks.sound == RING_TWEAK_SOUND else None
         if ring is not None:
-            expires_at = ring["sender_ts"] + min(ring["lifetime"], MAX_RING_LIFETIME_MS)
+            expires_at = _ring_expires_at(ring)
             if expires_at <= now:
                 log.info("Dropping expired ring notification (expires_at=%d)", expires_at)
                 return None
